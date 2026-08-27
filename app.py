@@ -1010,7 +1010,12 @@ if run_dt:
     #   × mean stress
     #   × disease/reaction factor
     #   then mean across mapped reactions
-    #   then existing 1-100 DSES scaling/clipping
+    #
+    # IMPORTANT:
+    #   No clipping is applied to the scaled DSES.
+    #   Values outside the nominal 1-100 reference range are
+    #   retained so that the distance calculation can preserve
+    #   the full magnitude of the patient's DSES signal.
     # ========================================================
 
     patient_dses = {}
@@ -1111,14 +1116,10 @@ if run_dt:
                 )
             )
 
-        # Preserve the existing DSES 1-100 clipping.
-        patient_dses[disease] = float(
-            np.clip(
-                scaled_dses,
-                dses_low,
-                dses_high,
-            )
-        )
+        # NO CLIPPING:
+        # Keep the complete scaled DSES value, even if it falls
+        # outside the nominal reference range.
+        patient_dses[disease] = float(scaled_dses)
 
         patient_dses_details[disease] = {
             "raw_dses": raw_dses,
