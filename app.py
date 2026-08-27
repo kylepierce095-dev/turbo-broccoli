@@ -1,4 +1,4 @@
-from pathlib import Path
+
 import re
 import numpy as np
 import pandas as pd
@@ -475,7 +475,17 @@ def build_expected_dses_row(disease_name, reaction_name):
 
 
 def predict_expected_dses(disease_name, reaction_name):
-    """Predict patient-conditioned expected DSES for one disease/reaction pair."""
+    """
+    Predict patient-conditioned expected DSES for one disease/reaction pair.
+
+    Returns both:
+        - mean expected DSES
+        - Random-Forest ensemble spread as an uncertainty proxy
+
+    The ensemble spread is only a fallback uncertainty estimate. When a
+    validation-derived disease-specific error artifact is available, that
+    artifact is preferred later in the standardized-distance calculation.
+    """
 
     raw_row = build_expected_dses_row(
         disease_name,
@@ -508,11 +518,40 @@ def predict_expected_dses(disease_name, reaction_name):
                 )
             )
 
-    prediction = DSES_RF_MODEL.predict(
-        df_aligned
-    )[0]
+    # Main Random Forest regressor prediction.
+    mean_prediction = float(
+        DSES_RF_MODEL.predict(
+            df_aligned
+        )[0]
+    )
 
-    return float(prediction)
+    # Ensemble spread across individual trees. This is an uncertainty proxy,
+    # not a clinical error bar. It is used only if a validation-derived
+    # error-scale artifact is not available.
+    tree_predictions = []
+
+    if hasattr(DSES_RF_MODEL, "estimators_"):
+        for tree in DSES_RF_MODEL.estimators_:
+            try:
+                tree_pred = float(
+                    tree.predict(df_aligned)[0]
+                )
+                if np.isfinite(tree_pred):
+                    tree_predictions.append(tree_pred)
+            except Exception:
+                continue
+
+    if len(tree_predictions) >= 2:
+        uncertainty = float(
+            np.std(
+                tree_predictions,
+                ddof=1,
+            )
+        )
+    else:
+        uncertainty = 0.0
+
+    return mean_prediction, uncertainty
 
 
 # ============================================================
@@ -1049,11 +1088,12 @@ if run_dt:
 
 
     # ========================================================
-    # NEW: PATIENT-CONDITIONED EXPECTED DSES
+    # PATIENT-CONDITIONED EXPECTED DSES
     # ========================================================
 
     expected_dses = {}
     expected_dses_details = {}
+    expected_dses_uncertainty = {}
 
     progress = st.empty()
 
@@ -1068,12 +1108,13 @@ if run_dt:
         )
 
         predictions = []
+        uncertainty_values = []
         reaction_rows = []
 
         for reaction in reactions:
 
             try:
-                expected_value = (
+                expected_value, ensemble_uncertainty = (
                     predict_expected_dses(
                         disease,
                         reaction,
@@ -1085,10 +1126,18 @@ if run_dt:
                         expected_value
                     )
 
+                    if np.isfinite(ensemble_uncertainty):
+                        uncertainty_values.append(
+                            ensemble_uncertainty
+                        )
+
                     reaction_rows.append(
                         {
                             "Biochemical Reaction": reaction,
                             "Patient-Conditioned Expected DSES": expected_value,
+                            "Expected DSES Ensemble Uncertainty": (
+                                ensemble_uncertainty
+                            ),
                         }
                     )
 
@@ -1097,6 +1146,7 @@ if run_dt:
                     {
                         "Biochemical Reaction": reaction,
                         "Patient-Conditioned Expected DSES": np.nan,
+                        "Expected DSES Ensemble Uncertainty": np.nan,
                         "Prediction Error": str(exc),
                     }
                 )
@@ -1108,9 +1158,165 @@ if run_dt:
         else:
             expected_dses[disease] = np.nan
 
+        if uncertainty_values:
+            expected_dses_uncertainty[disease] = float(
+                np.mean(uncertainty_values)
+            )
+        else:
+            expected_dses_uncertainty[disease] = np.nan
+
         expected_dses_details[disease] = reaction_rows
 
     progress.empty()
+
+
+    # ========================================================
+    # VALIDATION-DERIVED ERROR SCALE (PREFERRED)
+    # ========================================================
+    # Optional artifact supported by the training pipeline:
+    #   expected_dses_error_by_disease.joblib
+    # If it is absent, the app falls back to the RF tree-ensemble spread.
+    # ========================================================
+
+    validation_error_scales = _signature_ref.get(
+        "expected_dses_error_by_disease",
+        {}
+    )
+
+    if not isinstance(validation_error_scales, dict):
+        validation_error_scales = {}
+
+    fallback_error_values = [
+        float(v)
+        for v in expected_dses_uncertainty.values()
+        if np.isfinite(v) and v > SOFT_FLOOR
+    ]
+
+    global_error_floor = (
+        float(np.median(fallback_error_values))
+        if fallback_error_values
+        else 1.0
+    )
+
+    # Never allow zero/negative/invalid error scales.
+    global_error_floor = max(
+        global_error_floor,
+        SOFT_FLOOR,
+    )
+
+
+    # ========================================================
+    # DSES STANDARDIZED DISTANCE PROBABILITY
+    # ========================================================
+
+    valid_expected = {
+        d: v
+        for d, v in expected_dses.items()
+        if np.isfinite(v)
+        and d in patient_dses
+    }
+
+    if not valid_expected:
+        st.error(
+            "No patient-conditioned expected DSES values could be calculated."
+        )
+        st.stop()
+
+    distances = {
+        disease: abs(
+            patient_dses[disease]
+            - expected_value
+        )
+        for disease, expected_value in valid_expected.items()
+    }
+
+    error_scales = {}
+    standardized_distances = {}
+
+    for disease, distance in distances.items():
+
+        configured_error = validation_error_scales.get(
+            disease,
+            np.nan,
+        )
+
+        try:
+            configured_error = float(
+                configured_error
+            )
+        except (TypeError, ValueError):
+            configured_error = np.nan
+
+        ensemble_error = expected_dses_uncertainty.get(
+            disease,
+            np.nan,
+        )
+
+        if not np.isfinite(ensemble_error):
+            ensemble_error = np.nan
+
+        if (
+            np.isfinite(configured_error)
+            and configured_error > SOFT_FLOOR
+        ):
+            error_scale = configured_error
+            error_source = "Validation residual SD"
+
+        elif (
+            np.isfinite(ensemble_error)
+            and ensemble_error > SOFT_FLOOR
+        ):
+            error_scale = ensemble_error
+            error_source = "RF ensemble spread"
+
+        else:
+            error_scale = global_error_floor
+            error_source = "Global fallback error scale"
+
+        error_scales[disease] = {
+            "value": float(
+                max(error_scale, SOFT_FLOOR)
+            ),
+            "source": error_source,
+        }
+
+        standardized_distances[disease] = (
+            distance
+            / error_scales[disease]["value"]
+        )
+
+    # Gaussian-style similarity:
+    # z = distance / error scale
+    # similarity = exp(-0.5 * z^2)
+    # This strongly rewards a close match relative to expected model error.
+    distance_similarity_raw = {
+        disease: float(
+            np.exp(
+                -0.5
+                * standardized_distances[disease] ** 2
+            )
+        )
+        for disease in distances
+    }
+
+    similarity_total = sum(
+        distance_similarity_raw.values()
+    )
+
+    if (
+        similarity_total <= 0
+        or not np.isfinite(similarity_total)
+    ):
+        similarity_total = float(
+            len(distance_similarity_raw)
+        )
+
+    distance_probability = {
+        disease: value / similarity_total
+        for disease, value in (
+            distance_similarity_raw.items()
+        )
+    }
 
 
     # ========================================================
@@ -1265,6 +1471,8 @@ if run_dt:
                 "Patient DSES": patient_dses[disease],
                 "Expected DSES": expected_dses[disease],
                 "DSES Distance": distances[disease],
+                "DSES Error Scale": error_scales[disease]["value"],
+                "Standardized DSES Distance": standardized_distances[disease],
                 "DSES Distance Probability": (
                     distance_probability[disease] * 100.0
                 ),
@@ -1313,6 +1521,14 @@ if run_dt:
         "DSES Distance"
     ]
 
+    top_error_scale = disease_results.iloc[0][
+        "DSES Error Scale"
+    ]
+
+    top_standardized_distance = disease_results.iloc[0][
+        "Standardized DSES Distance"
+    ]
+
 
     # ========================================================
     # DIGITAL TWIN RESULTS
@@ -1352,10 +1568,11 @@ if run_dt:
     )
 
     st.caption(
-        "Primary ranking uses distance between the patient's DSES "
-        "and a patient-conditioned expected DSES learned by the "
-        "DSES regression model. The RF value is shown as a second "
-        "model signal."
+        "Primary ranking uses an uncertainty-adjusted DSES distance. "
+        "The patient's DSES is compared with a patient-conditioned expected "
+        "DSES, then divided by an error/uncertainty scale. Smaller standardized "
+        "distance means a closer disease match. The RF value is shown as a "
+        "second model signal."
     )
 
     display_cols = [
@@ -1364,6 +1581,8 @@ if run_dt:
         "Patient DSES",
         "Expected DSES",
         "DSES Distance",
+        "DSES Error Scale",
+        "Standardized DSES Distance",
         "DSES Distance Probability",
         "RF Probability",
         "Combined Model Probability",
@@ -1375,6 +1594,8 @@ if run_dt:
                 "Patient DSES": "{:.3f}",
                 "Expected DSES": "{:.3f}",
                 "DSES Distance": "{:.3f}",
+                "DSES Error Scale": "{:.3f}",
+                "Standardized DSES Distance": "{:.3f}",
                 "DSES Distance Probability": "{:.2f}%",
                 "RF Probability": "{:.2f}%",
                 "Combined Model Probability": "{:.2f}%",
@@ -1396,15 +1617,24 @@ if run_dt:
 
     st.info(
         f"Patient DSES = {top_patient_dses:.3f} | "
-        f"Patient-conditioned expected DSES = {top_expected_dses:.3f} | "
-        f"Distance = {top_distance:.3f}"
+        f"Expected DSES = {top_expected_dses:.3f} | "
+        f"Distance = {top_distance:.3f} | "
+        f"Error scale = {top_error_scale:.3f} | "
+        f"Standardized distance = {top_standardized_distance:.3f}"
     )
 
     st.caption(
-        "The displayed percentages are model estimates based on the "
-        "DSES-distance score and the existing disease-specific RF model. "
-        "They should not be interpreted as clinically calibrated probabilities "
-        "unless the scores are calibrated and validated on independent clinical data."
+        "The displayed percentages are model-estimated ranking scores. "
+        "The DSES-distance component uses standardized distance = absolute "
+        "DSES difference divided by an error/uncertainty scale, then applies "
+        "a Gaussian-style similarity. This is not a clinically calibrated "
+        "probability unless calibrated and validated on independent clinical data."
+    )
+
+    st.caption(
+        "Error-scale source: validation-derived residual SD when available; "
+        "otherwise the Random Forest ensemble spread is used as an uncertainty "
+        "proxy, with a global fallback if necessary."
     )
 
 
@@ -1477,6 +1707,36 @@ if run_dt:
 
 
     # ========================================================
+    # STANDARDIZED DISTANCE GRAPH
+    # ========================================================
+
+    fig_std_distance = go.Figure(
+        go.Bar(
+            x=disease_results["Disease"],
+            y=disease_results["Standardized DSES Distance"],
+        )
+    )
+
+    fig_std_distance.update_layout(
+        title="Standardized DSES Distance (Distance ÷ Error/Uncertainty Scale)",
+        xaxis_title="Disease",
+        yaxis_title="Standardized DSES Distance",
+        xaxis={"tickangle": -60},
+    )
+
+    fig_std_distance.add_hline(
+        y=1.0,
+        line_dash="dash",
+        annotation_text="1 × error scale",
+    )
+
+    st.plotly_chart(
+        fig_std_distance,
+        use_container_width=True,
+    )
+
+
+    # ========================================================
     # WHY WAS THIS DISEASE PREDICTED?
     # ========================================================
 
@@ -1489,9 +1749,11 @@ if run_dt:
         f"Its patient-conditioned expected DSES is "
         f"**{top_expected_dses:.3f}**, while the patient's calculated "
         f"DSES is **{top_patient_dses:.3f}**. The absolute distance is "
-        f"**{top_distance:.3f}**. A smaller distance means the patient's "
-        f"DSES is more similar to the expected DSES for that patient's "
-        f"profile and disease."
+        f"**{top_distance:.3f}**. The distance is then scaled by an "
+        f"error/uncertainty estimate of **{top_error_scale:.3f}**, giving a "
+        f"standardized distance of **{top_standardized_distance:.3f}**. "
+        f"Smaller standardized distance means a closer match relative to "
+        f"the expected model uncertainty."
     )
 
 
@@ -1831,6 +2093,8 @@ if run_dt:
                 "Patient DSES": "{:.3f}",
                 "Expected DSES": "{:.3f}",
                 "DSES Distance": "{:.3f}",
+                "DSES Error Scale": "{:.3f}",
+                "Standardized DSES Distance": "{:.3f}",
                 "DSES Distance Probability": "{:.2f}%",
                 "RF Probability": "{:.2f}%",
                 "Combined Model Probability": "{:.2f}%",
