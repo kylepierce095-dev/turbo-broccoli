@@ -147,12 +147,51 @@ DSES_CATEGORICAL_COLS = load_with_diagnostic(
 )
 
 
-T = float(_signature_ref.get("temperature_K", 310.15))
-DSES_MAPPING = _signature_ref.get("mapping", {})
-REACTION_REFS = _signature_ref.get("reaction_references", {})
+DSES_MAPPING_RAW = _signature_ref.get("mapping", {})
+
+REACTION_REFS = _signature_ref.get(
+    "reaction_references", {}
+)
+
 DISEASE_REACTION_FACTORS = _signature_ref.get(
     "disease_reaction_factors", {}
 )
+
+KNOWN_REACTIONS = {
+    "Metabolism",
+    "ATP Utilization",
+    "Ion Transport",
+    "Calcium Handling",
+    "Redox Metabolism",
+    "Nitric Oxide Metabolism",
+}
+
+if set(DSES_MAPPING_RAW.keys()).intersection(KNOWN_REACTIONS):
+
+    DSES_MAPPING = {}
+
+    for reaction_name, disease_list in DSES_MAPPING_RAW.items():
+
+        if reaction_name not in KNOWN_REACTIONS:
+            continue
+
+        for disease_name in disease_list:
+            DSES_MAPPING.setdefault(
+                disease_name,
+                []
+            ).append(reaction_name)
+
+else:
+    DSES_MAPPING = DSES_MAPPING_RAW
+
+DSES_MAPPING = {
+    disease: sorted(set(reactions))
+    for disease, reactions in DSES_MAPPING.items()
+}
+
+if not DSES_MAPPING:
+    st.error("The disease entropy signature mapping is empty.")
+    st.stop()
 
 if not DSES_MAPPING:
     st.error("The disease entropy signature mapping is empty.")
