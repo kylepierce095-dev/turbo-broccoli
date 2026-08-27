@@ -99,26 +99,52 @@ def load_joblib_required(filename):
 # LOAD DSES / DIGITAL-TWIN ARTIFACTS
 # ============================================================
 
-try:
-    _signature_ref = load_joblib_required(
-        "disease_entropy_signature_reference.pkl"
-    )
-    refs = load_joblib_required("dt_reference_values.pkl")
+def load_with_diagnostic(filename):
+    path = BASE_DIR / filename
 
-    DSES_RF_MODEL = load_joblib_required("dses_rf_model.joblib")
-    DSES_MODEL_COLUMNS = load_joblib_required("dses_model_columns.joblib")
-    DSES_MODEL_MEDIANS = load_joblib_required("dses_model_medians.joblib")
-    DSES_CATEGORICAL_COLS = load_joblib_required(
-        "dses_categorical_columns.joblib"
-    )
+    if not path.exists():
+        st.error(f"❌ FILE NOT FOUND: {filename}")
+        st.code(f"Expected location:\n{path}")
+        st.stop()
 
-except Exception as exc:
-    st.error("The Digital Twin model artifacts could not be loaded.")
-    st.code(str(exc))
-    st.info(
-        "Place the required .pkl/.joblib files in the same GitHub folder as app.py."
-    )
-    st.stop()
+    try:
+        obj = joblib.load(path)
+        st.success(f"✅ Loaded: {filename}")
+        return obj
+
+    except Exception as exc:
+        st.error(f"❌ FAILED TO LOAD: {filename}")
+        st.code(
+            f"Path: {path}\n"
+            f"Exception type: {type(exc).__name__}\n"
+            f"Error: {exc}"
+        )
+        st.stop()
+
+
+_signature_ref = load_with_diagnostic(
+    "disease_entropy_signature_reference.pkl"
+)
+
+refs = load_with_diagnostic(
+    "dt_reference_values.pkl"
+)
+
+DSES_RF_MODEL = load_with_diagnostic(
+    "dses_rf_model.joblib"
+)
+
+DSES_MODEL_COLUMNS = load_with_diagnostic(
+    "dses_model_columns.joblib"
+)
+
+DSES_MODEL_MEDIANS = load_with_diagnostic(
+    "dses_model_medians.joblib"
+)
+
+DSES_CATEGORICAL_COLS = load_with_diagnostic(
+    "dses_categorical_columns.joblib"
+)
 
 
 T = float(_signature_ref.get("temperature_K", 310.15))
