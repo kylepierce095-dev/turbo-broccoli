@@ -24,9 +24,10 @@ st.title("Cardio-Thermodynamic Digital Twin")
 # CONSTANTS / SAFE NUMERIC HELPERS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+BASE_DIR = Path(__file__).resolve().parent
 SOFT_FLOOR = 1e-6
 DG_FLOOR = 1.0
+GAS_CONSTANT_R = 8.314
 
 
 def soft_linear_floor(value, floor=SOFT_FLOOR):
@@ -99,34 +100,95 @@ def load_joblib_required(filename):
 # LOAD DSES / DIGITAL-TWIN ARTIFACTS
 # ============================================================
 
-try:
-    _signature_ref = load_joblib_required(
-        "disease_entropy_signature_reference.pkl"
-    )
-    refs = load_joblib_required("dt_reference_values.pkl")
+def load_with_diagnostic(filename):
+    path = BASE_DIR / filename
 
-    DSES_RF_MODEL = load_joblib_required("dses_rf_model.joblib")
-    DSES_MODEL_COLUMNS = load_joblib_required("dses_model_columns.joblib")
-    DSES_MODEL_MEDIANS = load_joblib_required("dses_model_medians.joblib")
-    DSES_CATEGORICAL_COLS = load_joblib_required(
-        "dses_categorical_columns.joblib"
-    )
+    if not path.exists():
+        st.error(f"❌ FILE NOT FOUND: {filename}")
+        st.code(f"Expected location:\n{path}")
+        st.stop()
 
-except Exception as exc:
-    st.error("The Digital Twin model artifacts could not be loaded.")
-    st.code(str(exc))
-    st.info(
-        "Place the required .pkl/.joblib files in the same GitHub folder as app.py."
-    )
-    st.stop()
+    try:
+        obj = joblib.load(path)
+        st.success(f"✅ Loaded: {filename}")
+        return obj
+
+    except Exception as exc:
+        st.error(f"❌ FAILED TO LOAD: {filename}")
+        st.code(
+            f"Path: {path}\n"
+            f"Exception type: {type(exc).__name__}\n"
+            f"Error: {exc}"
+        )
+        st.stop()
 
 
-T = float(_signature_ref.get("temperature_K", 310.15))
-DSES_MAPPING = _signature_ref.get("mapping", {})
-REACTION_REFS = _signature_ref.get("reaction_references", {})
+_signature_ref = load_with_diagnostic(
+    "disease_entropy_signature_reference.pkl"
+)
+
+refs = load_with_diagnostic(
+    "dt_reference_values.pkl"
+)
+
+DSES_RF_MODEL = load_with_diagnostic(
+    "dses_rf_model.joblib"
+)
+
+DSES_MODEL_COLUMNS = load_with_diagnostic(
+    "dses_model_columns.joblib"
+)
+
+DSES_MODEL_MEDIANS = load_with_diagnostic(
+    "dses_model_medians.joblib"
+)
+
+DSES_CATEGORICAL_COLS = load_with_diagnostic(
+    "dses_categorical_columns.joblib"
+)
+
+
+DSES_MAPPING_RAW = _signature_ref.get("mapping", {})
+
+REACTION_REFS = _signature_ref.get(
+    "reaction_references", {}
+)
+
 DISEASE_REACTION_FACTORS = _signature_ref.get(
     "disease_reaction_factors", {}
 )
+
+KNOWN_REACTIONS = {
+    "Metabolism",
+    "ATP Utilization",
+    "Ion Transport",
+    "Calcium Handling",
+    "Redox Metabolism",
+    "Nitric Oxide Metabolism",
+}
+
+if set(DSES_MAPPING_RAW.keys()).intersection(KNOWN_REACTIONS):
+
+    DSES_MAPPING = {}
+
+    for reaction_name, disease_list in DSES_MAPPING_RAW.items():
+
+        if reaction_name not in KNOWN_REACTIONS:
+            continue
+
+        for disease_name in disease_list:
+            DSES_MAPPING.setdefault(
+                disease_name,
+                []
+            ).append(reaction_name)
+
+else:
+    DSES_MAPPING = DSES_MAPPING_RAW
+
+DSES_MAPPING = {
+    disease: sorted(set(reactions))
+    for disease, reactions in DSES_MAPPING.items()
+}
 
 if not DSES_MAPPING:
     st.error("The disease entropy signature mapping is empty.")
@@ -171,6 +233,11 @@ if _missing_disease_models:
         "to the GitHub repository before running disease prediction."
     )
     st.stop()
+
+# Diagnostic summary: all disease-specific models are loaded.
+st.success(
+    f"✅ Loaded {len(_DSES_MODELS)} disease-specific DSES models."
+)
 
 
 # ============================================================
@@ -369,7 +436,7 @@ with c6:
     )
 
 disease_choice = st.selectbox(
-    "Disease to inspect in the detailed biochemical pathway view (optional)",
+    "Disease Hypothesis (for DSES scoring)",
     sorted(DSES_MAPPING.keys()),
 )
 
@@ -546,8 +613,6 @@ if run_dt:
     # Thermodynamic proxy layer
     # --------------------------------------------------------
 
-    R = 8.314
-
     safe_atp_balance = soft_positive_input(atp_balance)
 
     Q_metabolism = (
@@ -558,7 +623,7 @@ if run_dt:
 
     dg_metabolism = (
         -2870000
-        + R * T * np.log(Q_metabolism)
+        + GAS_CONSTANT_R * T * np.log(Q_metabolism)
     )
 
     Q_atp = soft_positive_input(
@@ -568,7 +633,7 @@ if run_dt:
 
     dg_atp = (
         -30500
-        + R * T * np.log(Q_atp)
+        + GAS_CONSTANT_R * T * np.log(Q_atp)
     )
 
     pH_factor = 10 ** (7.4 - ph)
@@ -579,7 +644,7 @@ if run_dt:
 
     dg_ion = (
         -50000
-        + R * T * np.log(Q_ion)
+        + GAS_CONSTANT_R * T * np.log(Q_ion)
     )
 
     calcium_factor = (
@@ -592,7 +657,7 @@ if run_dt:
 
     dg_calcium = (
         -50000
-        + R * T * np.log(Q_calcium)
+        + GAS_CONSTANT_R * T * np.log(Q_calcium)
     )
 
     redox_factor = spo2 / 100.0
@@ -603,7 +668,7 @@ if run_dt:
 
     dg_redox = (
         -220000
-        + R * T * np.log(Q_redox)
+        + GAS_CONSTANT_R * T * np.log(Q_redox)
     )
 
     no_factor = (
@@ -616,7 +681,7 @@ if run_dt:
 
     dg_no = (
         -100000
-        + R * T * np.log(Q_no)
+        + GAS_CONSTANT_R * T * np.log(Q_no)
     )
 
     total_dg = (
@@ -839,109 +904,7 @@ if run_dt:
         _patient_reaction_dses_components()
     )
 
-    # ========================================================
-    # DISEASE-SPECIFIC DSES + PATIENT-CONDITIONED EXPECTED DSES
-    # ========================================================
-    # IMPORTANT: the original DSES calculation above is preserved.
-    # We use its raw value for distance calculations and the original
-    # 1-100 representation for the already-trained one-dimensional RFs.
     patient_dses = {}
-    patient_raw_dses = {}
-    expected_dses = {}
-    expected_dses_uncertainty = {}
-
-    # Reference range used by the original DSES representation.
-    dses_min_ref = float(_signature_ref.get("raw_dses_min", 0.0))
-    dses_max_ref = float(_signature_ref.get("raw_dses_max", 1.0))
-    dses_low = float(_signature_ref.get("dses_range_low", 1.0))
-    dses_high = float(_signature_ref.get("dses_range_high", 100.0))
-
-    if dses_max_ref - dses_min_ref <= SOFT_FLOOR:
-        dses_max_ref = dses_min_ref + 1.0
-
-    def scale_original_dses(raw_dses):
-        """Preserve the original 1-100 DSES representation for RF input."""
-        value = dses_low + (
-            (raw_dses - dses_min_ref)
-            * (dses_high - dses_low)
-            / (dses_max_ref - dses_min_ref)
-        )
-        return float(np.clip(value, dses_low, dses_high))
-
-    def predict_expected_dses_for_disease(disease):
-        """Predict expected DSES separately for this patient and disease.
-
-        The regression model is asked about each biochemical reaction mapped
-        to the disease, then the reaction-level predictions are averaged.
-        Random-forest tree spread is retained as an uncertainty proxy.
-        """
-        reactions = DSES_MAPPING.get(disease, [])
-        predictions = []
-        spreads = []
-
-        for reaction_name in reactions:
-            raw_row = build_ml_input_row_for_disease(
-                disease, reaction_name
-            )
-            pred = predict_dses(raw_row)
-            predictions.append(float(pred))
-
-            # Ensemble spread: not a clinical error estimate; it is an
-            # internal uncertainty proxy available from the RF regressor.
-            try:
-                tree_preds = np.array([
-                    estimator.predict(
-                        _prepare_ml_dataframe(raw_row)
-                    )[0]
-                    for estimator in DSES_RF_MODEL.estimators_
-                ],
-                dtype=float)
-                tree_preds = tree_preds[np.isfinite(tree_preds)]
-                if tree_preds.size > 1:
-                    spreads.append(float(np.std(tree_preds, ddof=1)))
-            except Exception:
-                pass
-
-        if not predictions:
-            return SOFT_FLOOR, 1.0
-
-        expected = float(np.mean(predictions))
-        uncertainty = float(np.mean(spreads)) if spreads else 1.0
-        uncertainty = max(uncertainty, 1e-3)
-        return expected, uncertainty
-
-    def _prepare_ml_dataframe(raw_row_df):
-        df_enc = pd.get_dummies(
-            raw_row_df,
-            columns=[
-                c for c in DSES_CATEGORICAL_COLS
-                if c in raw_row_df.columns
-            ],
-            drop_first=True,
-            dtype=float,
-        )
-        df_aligned = df_enc.reindex(
-            columns=DSES_MODEL_COLUMNS,
-            fill_value=0.0,
-        )
-        for col in DSES_MODEL_COLUMNS:
-            if df_aligned[col].isna().any():
-                df_aligned[col] = df_aligned[col].fillna(
-                    DSES_MODEL_MEDIANS.get(col, 0.0)
-                )
-        return df_aligned
-
-    def predict_dses_for_disease(disease, reaction_name):
-        return predict_dses(
-            build_ml_input_row_for_disease(
-                disease, reaction_name
-            )
-        )
-
-    def build_ml_input_row_for_disease(disease, reaction_name):
-        row = build_ml_input_row(reaction_name).copy()
-        row.loc[:, "Disease"] = disease
-        return row
 
     for disease, reactions in DSES_MAPPING.items():
         components = []
@@ -969,111 +932,134 @@ if run_dt:
             SOFT_FLOOR,
         )
 
-        patient_raw_dses[disease] = raw_dses
-        patient_dses[disease] = scale_original_dses(raw_dses)
+        dses_min = float(
+            _signature_ref.get(
+                "raw_dses_min",
+                raw_dses,
+            )
+        )
 
-        # Patient-conditioned expected DSES: every disease gets its own
-        # expected value using the current patient's complete profile.
-        expected, uncertainty = predict_expected_dses_for_disease(disease)
-        expected_dses[disease] = expected
-        expected_dses_uncertainty[disease] = uncertainty
+        dses_max = float(
+            _signature_ref.get(
+                "raw_dses_max",
+                raw_dses,
+            )
+        )
+
+        dses_low = float(
+            _signature_ref.get(
+                "dses_range_low",
+                1.0,
+            )
+        )
+
+        dses_high = float(
+            _signature_ref.get(
+                "dses_range_high",
+                100.0,
+            )
+        )
+
+        if dses_max - dses_min <= SOFT_FLOOR:
+            range_dses = (
+                dses_low + dses_high
+            ) / 2.0
+        else:
+            range_dses = (
+                dses_low
+                + (
+                    (raw_dses - dses_min)
+                    * (dses_high - dses_low)
+                    / (dses_max - dses_min)
+                )
+            )
+
+        patient_dses[disease] = float(
+            np.clip(
+                range_dses,
+                dses_low,
+                dses_high,
+            )
+        )
 
     # --------------------------------------------------------
-    # ONE-DIMENSIONAL RANDOM-FOREST PROBABILITIES
+    # ONE-VS-REST RANDOM-FOREST PROBABILITIES
     # --------------------------------------------------------
-    # The RF still receives exactly ONE scalar: the original DSES.
-    # Keeping it in its trained 1-100 domain avoids feeding the classifier
-    # values outside the distribution it was trained on.
-    raw_rf_probs = {}
+
+    raw_probs = {}
 
     for disease, dses_value in patient_dses.items():
         model = _DSES_MODELS[disease]
-        x_one = np.array([[dses_value]], dtype=float)
+
+        x_one = np.array(
+            [[dses_value]],
+            dtype=float,
+        )
+
         proba_matrix = model.predict_proba(x_one)
-        class_to_col = {int(cls): i for i, cls in enumerate(model.classes_)}
-        raw_rf_probs[disease] = float(
-            proba_matrix[0, class_to_col[1]]
+
+        class_to_col = {
+            int(cls): i
+            for i, cls in enumerate(model.classes_)
+        }
+
+        raw_probs[disease] = float(
+            proba_matrix[
+                0,
+                class_to_col[1],
+            ]
             if 1 in class_to_col
             else SOFT_FLOOR
         )
 
-    rf_total = sum(raw_rf_probs.values())
-    if rf_total <= 0 or not np.isfinite(rf_total):
-        rf_total = 1.0
-    rf_probabilities = {
-        disease: value / rf_total
-        for disease, value in raw_rf_probs.items()
+    prob_total = sum(raw_probs.values())
+
+    if (
+        prob_total <= 0
+        or not np.isfinite(prob_total)
+    ):
+        prob_total = 1.0
+
+    probabilities = {
+        disease: value / prob_total
+        for disease, value in raw_probs.items()
     }
 
-    # --------------------------------------------------------
-    # PATIENT-vs-EXPECTED DSES DISTANCE
-    # --------------------------------------------------------
-    # Distance is calculated in the same raw DSES scale, so clipping of the
-    # RF input cannot hide how far the patient's raw DSES is from expectation.
-    distances = {}
-    standardized_distances = {}
-    distance_similarity = {}
+    disease_results = pd.DataFrame(
+        {
+            "Disease": list(probabilities.keys()),
+            "Disease Entropy Signature": [
+                patient_dses[d]
+                for d in probabilities
+            ],
+            "Probability": [
+                probabilities[d]
+                for d in probabilities
+            ],
+        }
+    )
 
-    for disease in DSES_MAPPING:
-        distance = abs(
-            patient_raw_dses[disease] - expected_dses[disease]
+    disease_results["Probability (%)"] = (
+        disease_results["Probability"]
+        * 100.0
+    )
+
+    disease_results = (
+        disease_results
+        .sort_values(
+            "Probability",
+            ascending=False,
         )
-        scale = max(expected_dses_uncertainty[disease], 1e-3)
-        z = distance / scale
+        .reset_index(drop=True)
+    )
 
-        distances[disease] = float(distance)
-        standardized_distances[disease] = float(z)
-        distance_similarity[disease] = float(
-            np.exp(-0.5 * min(z * z, 700.0))
-        )
-
-    sim_total = sum(distance_similarity.values())
-    if sim_total <= 0 or not np.isfinite(sim_total):
-        sim_total = 1.0
-    distance_probabilities = {
-        disease: value / sim_total
-        for disease, value in distance_similarity.items()
-    }
-
-    # --------------------------------------------------------
-    # ROBUST TWO-SIGNAL ENSEMBLE
-    # --------------------------------------------------------
-    # Geometric mean prevents a disease from winning solely because one
-    # signal is large while the other signal strongly disagrees.
-    combined_raw = {}
-    for disease in DSES_MAPPING:
-        combined_raw[disease] = np.sqrt(
-            max(rf_probabilities[disease], SOFT_FLOOR)
-            * max(distance_probabilities[disease], SOFT_FLOOR)
-        )
-
-    combined_total = sum(combined_raw.values())
-    if combined_total <= 0 or not np.isfinite(combined_total):
-        combined_total = 1.0
-    combined_probabilities = {
-        disease: value / combined_total
-        for disease, value in combined_raw.items()
-    }
-
-    disease_results = pd.DataFrame({
-        "Disease": list(DSES_MAPPING.keys()),
-        "Patient DSES": [patient_dses[d] for d in DSES_MAPPING],
-        "Raw Patient DSES": [patient_raw_dses[d] for d in DSES_MAPPING],
-        "Expected DSES": [expected_dses[d] for d in DSES_MAPPING],
-        "DSES Distance": [distances[d] for d in DSES_MAPPING],
-        "RF Uncertainty Scale": [expected_dses_uncertainty[d] for d in DSES_MAPPING],
-        "Standardized Distance": [standardized_distances[d] for d in DSES_MAPPING],
-        "RF Probability (%)": [rf_probabilities[d] * 100 for d in DSES_MAPPING],
-        "Distance Probability (%)": [distance_probabilities[d] * 100 for d in DSES_MAPPING],
-        "Probability": [combined_probabilities[d] for d in DSES_MAPPING],
-    })
-
-    disease_results["Probability (%)"] = disease_results["Probability"] * 100.0
-    disease_results = disease_results.sort_values(
-        "Probability", ascending=False
-    ).reset_index(drop=True)
     disease_results.insert(
-        0, "Rank", np.arange(1, len(disease_results) + 1)
+        0,
+        "Rank",
+        np.arange(
+            1,
+            len(disease_results) + 1,
+        ),
     )
 
     # ========================================================
@@ -1115,22 +1101,12 @@ if run_dt:
             [
                 "Rank",
                 "Disease",
-                "Patient DSES",
-                "Expected DSES",
-                "DSES Distance",
-                "Standardized Distance",
-                "RF Probability (%)",
-                "Distance Probability (%)",
+                "Disease Entropy Signature",
                 "Probability (%)",
             ]
         ].style.format(
             {
-                "Patient DSES": "{:.3f}",
-                "Expected DSES": "{:.3f}",
-                "DSES Distance": "{:.3f}",
-                "Standardized Distance": "{:.3f}",
-                "RF Probability (%)": "{:.2f}%",
-                "Distance Probability (%)": "{:.2f}%",
+                "Disease Entropy Signature": "{:.3f}",
                 "Probability (%)": "{:.2f}%",
             }
         ),
@@ -1169,12 +1145,6 @@ if run_dt:
     st.plotly_chart(
         fig,
         use_container_width=True,
-    )
-
-    st.info(
-        "Final probability uses a geometric ensemble of the existing one-scalar RF probability "
-        "and the patient-vs-expected DSES distance signal. The RF still receives exactly one DSES value. "
-        "The uncertainty scale is an RF ensemble-spread proxy, not a clinical measurement error."
     )
 
     st.success(
@@ -1281,12 +1251,7 @@ if run_dt:
             [
                 "Rank",
                 "Disease",
-                "Patient DSES",
-                "Expected DSES",
-                "DSES Distance",
-                "Standardized Distance",
-                "RF Probability (%)",
-                "Distance Probability (%)",
+                "Disease Entropy Signature",
                 "Probability (%)",
             ]
         ].copy()
@@ -1294,12 +1259,7 @@ if run_dt:
         st.dataframe(
             dses_display.style.format(
                 {
-                    "Patient DSES": "{:.3f}",
-                    "Expected DSES": "{:.3f}",
-                    "DSES Distance": "{:.3f}",
-                    "Standardized Distance": "{:.3f}",
-                    "RF Probability (%)": "{:.2f}%",
-                    "Distance Probability (%)": "{:.2f}%",
+                    "Disease Entropy Signature": "{:.3f}",
                     "Probability (%)": "{:.2f}%",
                 }
             ),
