@@ -1193,7 +1193,7 @@ if run_dt:
                     {
                         "Biochemical Reaction": reaction,
                         "RF Expected DSES": predicted,
-                        "RF Tree Spread": uncertainty,
+                        "RF Predictive Spread": uncertainty,
                     }
                 )
 
@@ -1203,7 +1203,7 @@ if run_dt:
                     {
                         "Biochemical Reaction": reaction,
                         "RF Expected DSES": np.nan,
-                        "RF Tree Spread": np.nan,
+                        "RF Predictive Spread": np.nan,
                         "Error": str(exc),
                     }
                 )
@@ -1269,11 +1269,11 @@ if run_dt:
     }
 
     # ========================================================
-    # UNCERTAINTY-ADJUSTED / STANDARDIZED DISTANCE
+    # PREDICTIVE-UNCERTAINTY-ADJUSTED / STANDARDIZED DISTANCE
     #
-    # z = |Patient DSES - Expected DSES| / RF tree spread
+    # z = |Patient DSES - Expected DSES| / predictive predictive RF tree spread
     #
-    # If the RF tree spread is unavailable or zero, use a
+    # If the predictive RF tree spread is unavailable or zero, use a
     # robust global fallback.
     # ========================================================
 
@@ -1325,10 +1325,10 @@ if run_dt:
             and uncertainty > SOFT_FLOOR
         ):
             scale = float(uncertainty)
-            source = "RF tree spread"
+            source = "predictive RF tree spread"
         else:
             scale = global_uncertainty
-            source = "Global RF-spread fallback"
+            source = "Global predictive-spread fallback"
 
         standardized_distances[disease] = (
             distances[disease]
@@ -1344,48 +1344,29 @@ if run_dt:
         }
 
     # ========================================================
-    # DISTANCE-BASED PROBABILITY
+    # DSES MATCH INDEX
     #
-    # This is a normalized similarity score, not a clinically
-    # calibrated probability.
+    # The primary ranking quantity is standardized DSES distance z.
+    # The match index is an independent similarity measure:
     #
-    # similarity = exp(-0.5 * z^2)
+    #     MatchIndex = 1 / (1 + z^2)
+    #
+    # It is NOT normalized across diseases and is NOT a probability.
+    # Therefore the winning disease is never converted into a forced
+    # 100% value simply because it ranks first.
     # ========================================================
 
-    distance_similarity_raw = {
+    dses_match_index = {
         disease: float(
-            np.exp(
-                -0.5
-                * standardized_distances[disease] ** 2
-            )
+            1.0 / (1.0 + standardized_distances[disease] ** 2)
         )
         for disease in valid_diseases
-    }
-
-    similarity_total = sum(
-        distance_similarity_raw.values()
-    )
-
-    if (
-        similarity_total <= 0
-        or not np.isfinite(similarity_total)
-    ):
-        similarity_total = float(
-            len(distance_similarity_raw)
-        )
-
-    distance_probability = {
-        disease: (
-            value / similarity_total
-        )
-        for disease, value in (
-            distance_similarity_raw.items()
-        )
     }
 
     # ========================================================
     # RESULTS TABLE
     # ========================================================
+
 
     result_rows = []
 
@@ -1397,19 +1378,16 @@ if run_dt:
                 "Patient DSES": patient_dses[disease],
                 "Expected DSES (RF)": expected_dses[disease],
                 "DSES Distance": distances[disease],
-                "RF Tree Spread": error_sources[disease]["scale"],
+                "RF Predictive Spread": error_sources[disease]["scale"],
                 "Standardized Distance": standardized_distances[disease],
-                "Distance Probability": (
-                    distance_probability[disease]
-                    * 100.0
-                ),
+                "DSES Match Index": dses_match_index[disease],
             }
         )
 
     disease_results = (
         pd.DataFrame(result_rows)
         .sort_values(
-            "Distance Probability",
+            "DSES Match Index",
             ascending=False,
         )
         .reset_index(drop=True)
@@ -1427,7 +1405,7 @@ if run_dt:
     top = disease_results.iloc[0]
 
     top_disease = top["Disease"]
-    top_probability = top["Distance Probability"]
+    top_match_index = top["DSES Match Index"]
     top_patient_dses = top["Patient DSES"]
     top_expected_dses = top["Expected DSES (RF)"]
     top_distance = top["DSES Distance"]
@@ -1465,7 +1443,7 @@ if run_dt:
     # MAIN DISEASE RANKING
     # ========================================================
 
-    st.header("Disease Probability Ranking")
+    st.header("DSES Disease Ranking")
 
     st.caption(
         "The RF is used as a single-scalar DSES regressor: "
@@ -1481,9 +1459,9 @@ if run_dt:
         "Patient DSES",
         "Expected DSES (RF)",
         "DSES Distance",
-        "RF Tree Spread",
+        "RF Predictive Spread",
         "Standardized Distance",
-        "Distance Probability",
+        "DSES Match Index",
     ]
 
     st.dataframe(
@@ -1492,9 +1470,9 @@ if run_dt:
                 "Patient DSES": "{:.3f}",
                 "Expected DSES (RF)": "{:.3f}",
                 "DSES Distance": "{:.3f}",
-                "RF Tree Spread": "{:.3f}",
+                "RF Predictive Spread": "{:.3f}",
                 "Standardized Distance": "{:.3f}",
-                "Distance Probability": "{:.2f}%",
+                "DSES Match Index": "{:.3f}",
             }
         ),
         use_container_width=True,
@@ -1502,8 +1480,8 @@ if run_dt:
     )
 
     st.success(
-        f"Top model-ranked disease: {top_disease} "
-        f"({top_probability:.2f}% similarity-based score)"
+        f"Top DSES-matched disease: {top_disease} "
+        f"(DSES match = {top_match_index:.3f})"
     )
 
     st.info(
@@ -1513,30 +1491,48 @@ if run_dt:
         f"Standardized distance = {top_std_distance:.3f}"
     )
 
-    st.warning(
-        "These percentages are normalized DSES-distance similarity "
-        "scores, not clinically calibrated probabilities. Clinical "
-        "probability requires independent patient-level validation "
-        "and calibration."
+    if top_std_distance <= 0.5:
+        match_band = "Very high DSES match"
+    elif top_std_distance <= 1.0:
+        match_band = "High DSES match"
+    elif top_std_distance <= 2.0:
+        match_band = "Moderate DSES match"
+    elif top_std_distance <= 3.0:
+        match_band = "Low DSES match"
+    else:
+        match_band = "Very low DSES match"
+
+    st.caption(
+        f"Interpretation of the leading standardized distance: "
+        f"**{match_band}**. "
+        "This is a model-based DSES interpretation, not a diagnosis."
+    )
+
+    st.info(
+        "DSES Match Index is an independent 0–1 similarity index, "
+        "not a percentage and not a clinical probability. It is never "
+        "normalized across diseases. The primary ranking quantity is "
+        "the smallest standardized DSES distance. Clinical validation "
+        "requires an independent dataset of patients with confirmed diagnoses."
     )
 
     # ========================================================
-    # PROBABILITY CHART
+    # COMPATIBILITY CHART
     # ========================================================
 
-    fig_prob = go.Figure(
+    fig_compat = go.Figure(
         go.Bar(
             x=disease_results[
-                "Distance Probability"
+                "DSES Match Index"
             ],
             y=disease_results["Disease"],
             orientation="h",
         )
     )
 
-    fig_prob.update_layout(
-        title="DSES Distance-Based Disease Ranking",
-        xaxis_title="Normalized Similarity (%)",
+    fig_compat.update_layout(
+        title="Independent DSES Match Index by Disease",
+        xaxis_title="DSES Match Index (0–1, higher = closer)",
         yaxis_title="Disease",
         yaxis={
             "categoryorder": "array",
@@ -1547,7 +1543,7 @@ if run_dt:
     )
 
     st.plotly_chart(
-        fig_prob,
+        fig_compat,
         use_container_width=True,
     )
 
@@ -1733,7 +1729,7 @@ if run_dt:
                     np.nan,
                 )
                 expected_spread = row.get(
-                    "RF Tree Spread",
+                    "RF Predictive Spread",
                     np.nan,
                 )
                 break
@@ -1762,7 +1758,7 @@ if run_dt:
                 "Disease Factor": factor,
                 "Patient DSES Component": component_dses,
                 "RF Expected DSES": expected_value,
-                "RF Tree Spread": expected_spread,
+                "RF Predictive Spread": expected_spread,
             }
         )
 
@@ -1784,7 +1780,7 @@ if run_dt:
                     "Disease Factor": "{:.3f}",
                     "Patient DSES Component": "{:.3f}",
                     "RF Expected DSES": "{:.3f}",
-                    "RF Tree Spread": "{:.3f}",
+                    "RF Predictive Spread": "{:.3f}",
                 }
             ),
             use_container_width=True,
@@ -1857,7 +1853,7 @@ if run_dt:
                     {
                         "Biochemical Reaction": reaction,
                         "RF Expected DSES": predicted,
-                        "RF Tree Spread": uncertainty,
+                        "RF Predictive Spread": uncertainty,
                     }
                 )
 
@@ -1867,7 +1863,7 @@ if run_dt:
                     {
                         "Biochemical Reaction": reaction,
                         "RF Expected DSES": np.nan,
-                        "RF Tree Spread": np.nan,
+                        "RF Predictive Spread": np.nan,
                         "Error": str(exc),
                     }
                 )
@@ -1878,7 +1874,7 @@ if run_dt:
             ).style.format(
                 {
                     "RF Expected DSES": "{:.3f}",
-                    "RF Tree Spread": "{:.3f}",
+                    "RF Predictive Spread": "{:.3f}",
                 }
             ),
             use_container_width=True,
@@ -1990,18 +1986,18 @@ if run_dt:
                 "Patient DSES",
                 "Expected DSES (RF)",
                 "DSES Distance",
-                "RF Tree Spread",
+                "RF Predictive Spread",
                 "Standardized Distance",
-                "Distance Probability",
+                "DSES Match Index",
             ]
         ].style.format(
             {
                 "Patient DSES": "{:.3f}",
                 "Expected DSES (RF)": "{:.3f}",
                 "DSES Distance": "{:.3f}",
-                "RF Tree Spread": "{:.3f}",
+                "RF Predictive Spread": "{:.3f}",
                 "Standardized Distance": "{:.3f}",
-                "Distance Probability": "{:.2f}%",
+                "DSES Match Index": "{:.3f}",
             }
         ),
         use_container_width=True,
