@@ -1,4 +1,4 @@
-
+from pathlib import Path
 import re
 import numpy as np
 import pandas as pd
@@ -21,7 +21,7 @@ st.title("Cardio-Thermodynamic Digital Twin")
 # GLOBAL CONSTANTS / SAFE NUMERIC HELPERS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 SOFT_FLOOR = 1e-6
 DG_FLOOR = 1.0
 DEFAULT_TEMPERATURE_K = 310.15
