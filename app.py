@@ -1269,93 +1269,151 @@ if run_dt:
     }
 
     # ========================================================
-    # PREDICTIVE-UNCERTAINTY-ADJUSTED / STANDARDIZED DISTANCE
+    # STANDARDIZED DSES DISTANCE + DSES-DERIVED PROBABILITY
     #
-    # z = |Patient DSES - Expected DSES| / predictive predictive RF tree spread
+    # The RF remains a SINGLE SCALAR DSES REGRESSOR. It does not
+    # classify disease and its predict_proba() is never used.
     #
-    # If the predictive RF tree spread is unavailable or zero, use a
-    # robust global fallback.
+    # For disease d:
+    #   distance_d = |patient_DSES - expected_DSES_d|
+    #   z_d        = distance_d / uncertainty_d
+    #
+    # The uncertainty is based on the spread of the RF trees. To
+    # avoid unrealistically tiny denominators, we impose a robust
+    # uncertainty floor derived from the RF spreads and the spread
+    # of the expected-DSES values across diseases.
+    #
+    # We then convert distance to a robust likelihood using a
+    # Student-t kernel (4 degrees of freedom). This is deliberately
+    # less overconfident than a Gaussian kernel when RF uncertainty
+    # is small or when candidate diseases are far apart:
+    #   L_d = (1 + z_d^2 / nu)^(-(nu+1)/2),  nu = 4
+    #
+    # With uniform disease priors (because this project does not
+    # contain validated prevalence priors):
+    #   P_d = L_d / sum(L_j)
+    #
+    # IMPORTANT: this is a DSES-model posterior, NOT a clinically
+    # calibrated probability. It is only a probability-like model
+    # output until externally validated/calibrated on diagnosed
+    # patients.
     # ========================================================
 
     uncertainty_values = [
         safe_float(
-            expected_dses_uncertainty.get(
-                disease,
-                np.nan,
-            ),
+            expected_dses_uncertainty.get(disease, np.nan),
             np.nan,
         )
         for disease in valid_diseases
     ]
 
-    positive_uncertainties = [
-        x for x in uncertainty_values
-        if np.isfinite(x)
-        and x > SOFT_FLOOR
-    ]
-
-    global_uncertainty = (
-        float(np.median(positive_uncertainties))
-        if positive_uncertainties
-        else max(
-            float(np.std(
-                list(distances.values())
-            )),
-            1.0,
-        )
+    positive_uncertainties = np.asarray(
+        [x for x in uncertainty_values if np.isfinite(x) and x > SOFT_FLOOR],
+        dtype=float,
     )
 
-    global_uncertainty = max(
-        global_uncertainty,
-        SOFT_FLOOR,
+    # Robust spread of the patient-conditioned expected DSES values.
+    # This prevents a very small RF tree spread from creating an
+    # artificially sharp probability distribution.
+    expected_values = np.asarray(
+        [expected_dses[d] for d in valid_diseases if np.isfinite(expected_dses[d])],
+        dtype=float,
+    )
+
+    if expected_values.size >= 2:
+        q1, q3 = np.percentile(expected_values, [25, 75])
+        expected_iqr = float(q3 - q1)
+        expected_mad = float(
+            np.median(np.abs(expected_values - np.median(expected_values)))
+        )
+    else:
+        expected_iqr = 0.0
+        expected_mad = 0.0
+
+    if positive_uncertainties.size:
+        robust_rf_spread = float(np.median(positive_uncertainties))
+    else:
+        robust_rf_spread = 0.0
+
+    # The floor is deliberately conservative rather than a clipping
+    # of DSES itself. It acts only on uncertainty in the probability
+    # calculation.
+    uncertainty_floor_candidates = [
+        robust_rf_spread * 0.50,
+        expected_iqr * 0.25,
+        expected_mad * 1.4826,
+        1.0,
+    ]
+    uncertainty_floor = max(
+        [x for x in uncertainty_floor_candidates if np.isfinite(x)]
+        + [SOFT_FLOOR]
     )
 
     standardized_distances = {}
+    effective_uncertainties = {}
     error_sources = {}
 
     for disease in valid_diseases:
-
-        uncertainty = expected_dses_uncertainty.get(
-            disease,
+        rf_spread = safe_float(
+            expected_dses_uncertainty.get(disease, np.nan),
             np.nan,
         )
 
-        if (
-            np.isfinite(uncertainty)
-            and uncertainty > SOFT_FLOOR
-        ):
-            scale = float(uncertainty)
-            source = "predictive RF tree spread"
+        # Use the disease-specific RF spread when it is informative;
+        # otherwise fall back to the robust project-level floor.
+        if np.isfinite(rf_spread) and rf_spread > uncertainty_floor:
+            scale = float(rf_spread)
+            source = "Disease-specific RF tree spread"
         else:
-            scale = global_uncertainty
-            source = "Global predictive-spread fallback"
+            scale = float(uncertainty_floor)
+            source = "Robust uncertainty floor"
 
+        effective_uncertainties[disease] = scale
         standardized_distances[disease] = (
-            distances[disease]
-            / max(
-                scale,
-                SOFT_FLOOR,
-            )
+            distances[disease] / max(scale, SOFT_FLOOR)
         )
-
         error_sources[disease] = {
             "scale": scale,
             "source": source,
         }
 
-    # ========================================================
-    # DSES MATCH INDEX
-    #
-    # The primary ranking quantity is standardized DSES distance z.
-    # The match index is an independent similarity measure:
-    #
-    #     MatchIndex = 1 / (1 + z^2)
-    #
-    # It is NOT normalized across diseases and is NOT a probability.
-    # Therefore the winning disease is never converted into a forced
-    # 100% value simply because it ranks first.
-    # ========================================================
+    # --------------------------------------------------------
+    # DSES LIKELIHOOD
+    # --------------------------------------------------------
 
+    # Heavy-tailed Student-t likelihood reduces the tendency of the
+    # probability calculation to collapse to 100% for one disease.
+    # It is still a model-derived probability, not a calibrated
+    # clinical probability.
+    STUDENT_T_DF = 4.0
+
+    log_likelihoods = {}
+    for disease in valid_diseases:
+        z = standardized_distances[disease]
+        log_likelihoods[disease] = (
+            -0.5 * (STUDENT_T_DF + 1.0)
+            * np.log1p((z ** 2) / STUDENT_T_DF)
+        )
+
+    # Uniform priors are used because validated disease prevalence
+    # priors are not part of the supplied model artifacts.
+    # Use log-sum-exp for numerical stability.
+    log_values = np.asarray(
+        [log_likelihoods[d] for d in valid_diseases],
+        dtype=float,
+    )
+    max_log = float(np.max(log_values))
+    exp_values = np.exp(log_values - max_log)
+    probability_denominator = float(np.sum(exp_values))
+
+    dses_probability = {}
+    for disease, exp_value in zip(valid_diseases, exp_values):
+        dses_probability[disease] = float(
+            exp_value / max(probability_denominator, SOFT_FLOOR)
+        )
+
+    # A bounded similarity index is retained as a secondary diagnostic
+    # measure. It is NOT the probability and is NOT used to calculate it.
     dses_match_index = {
         disease: float(
             1.0 / (1.0 + standardized_distances[disease] ** 2)
@@ -1380,6 +1438,8 @@ if run_dt:
                 "DSES Distance": distances[disease],
                 "RF Predictive Spread": error_sources[disease]["scale"],
                 "Standardized Distance": standardized_distances[disease],
+                "DSES Relative Likelihood": float(np.exp(log_likelihoods[disease] - max_log)),
+                "DSES Probability": dses_probability[disease],
                 "DSES Match Index": dses_match_index[disease],
             }
         )
@@ -1387,7 +1447,7 @@ if run_dt:
     disease_results = (
         pd.DataFrame(result_rows)
         .sort_values(
-            "DSES Match Index",
+            "DSES Probability",
             ascending=False,
         )
         .reset_index(drop=True)
@@ -1405,6 +1465,7 @@ if run_dt:
     top = disease_results.iloc[0]
 
     top_disease = top["Disease"]
+    top_probability = top["DSES Probability"]
     top_match_index = top["DSES Match Index"]
     top_patient_dses = top["Patient DSES"]
     top_expected_dses = top["Expected DSES (RF)"]
@@ -1461,6 +1522,7 @@ if run_dt:
         "DSES Distance",
         "RF Predictive Spread",
         "Standardized Distance",
+        "DSES Probability",
         "DSES Match Index",
     ]
 
@@ -1472,6 +1534,7 @@ if run_dt:
                 "DSES Distance": "{:.3f}",
                 "RF Predictive Spread": "{:.3f}",
                 "Standardized Distance": "{:.3f}",
+                "DSES Probability": "{:.2%}",
                 "DSES Match Index": "{:.3f}",
             }
         ),
@@ -1481,7 +1544,7 @@ if run_dt:
 
     st.success(
         f"Top DSES-matched disease: {top_disease} "
-        f"(DSES match = {top_match_index:.3f})"
+        f"(DSES-derived probability = {top_probability:.2%})"
     )
 
     st.info(
@@ -1509,11 +1572,12 @@ if run_dt:
     )
 
     st.info(
-        "DSES Match Index is an independent 0–1 similarity index, "
-        "not a percentage and not a clinical probability. It is never "
-        "normalized across diseases. The primary ranking quantity is "
-        "the smallest standardized DSES distance. Clinical validation "
-        "requires an independent dataset of patients with confirmed diagnoses."
+        "DSES-derived probability is calculated from the standardized DSES distance "
+        "using a robust Student-t distance likelihood and uniform disease priors. "
+        "The probabilities are normalized across the diseases evaluated, so they "
+        "sum to 100% across this model's candidate set. This is NOT a clinically "
+        "calibrated probability unless validated against independently diagnosed patients. "
+        "DSES Match Index is a separate 0–1 similarity measure."
     )
 
     # ========================================================
@@ -1544,6 +1608,34 @@ if run_dt:
 
     st.plotly_chart(
         fig_compat,
+        use_container_width=True,
+    )
+
+    # ========================================================
+    # DSES-DERIVED PROBABILITY CHART
+    # ========================================================
+
+    fig_probability = go.Figure(
+        go.Bar(
+            x=disease_results["DSES Probability"] * 100.0,
+            y=disease_results["Disease"],
+            orientation="h",
+        )
+    )
+
+    fig_probability.update_layout(
+        title="DSES-Derived Disease Probability (Model Output)",
+        xaxis_title="DSES-derived probability (%)",
+        yaxis_title="Disease",
+        xaxis={"range": [0, 100]},
+        yaxis={
+            "categoryorder": "array",
+            "categoryarray": disease_results["Disease"].tolist(),
+        },
+    )
+
+    st.plotly_chart(
+        fig_probability,
         use_container_width=True,
     )
 
@@ -1613,7 +1705,8 @@ if run_dt:
         f"patient-conditioned expected DSES among the evaluated "
         f"diseases. Its absolute DSES distance is "
         f"**{top_distance:.3f}**, corresponding to a standardized "
-        f"distance of **{top_std_distance:.3f}**."
+        f"distance of **{top_std_distance:.3f}**. The corresponding "
+        f"DSES-derived model probability is **{top_probability:.2%}**."
     )
 
     # ========================================================
@@ -1988,6 +2081,8 @@ if run_dt:
                 "DSES Distance",
                 "RF Predictive Spread",
                 "Standardized Distance",
+                "DSES Relative Likelihood",
+                "DSES Probability",
                 "DSES Match Index",
             ]
         ].style.format(
@@ -1997,6 +2092,8 @@ if run_dt:
                 "DSES Distance": "{:.3f}",
                 "RF Predictive Spread": "{:.3f}",
                 "Standardized Distance": "{:.3f}",
+                "DSES Relative Likelihood": "{:.3f}",
+                "DSES Probability": "{:.2%}",
                 "DSES Match Index": "{:.3f}",
             }
         ),
