@@ -27,7 +27,6 @@ st.title("Cardio-Thermodynamic Digital Twin")
 BASE_DIR = Path(__file__).resolve().parent
 SOFT_FLOOR = 1e-6
 DG_FLOOR = 1.0
-GAS_CONSTANT_R = 8.314
 
 
 def soft_linear_floor(value, floor=SOFT_FLOOR):
@@ -148,6 +147,16 @@ DSES_CATEGORICAL_COLS = load_with_diagnostic(
 )
 
 
+# Thermodynamic constants must be defined at module scope so they are
+# available when the Streamlit button calculation executes.
+T = float(
+    _signature_ref.get(
+        "temperature_K",
+        310.15,
+    )
+)
+R = 8.314
+
 DSES_MAPPING_RAW = _signature_ref.get("mapping", {})
 
 REACTION_REFS = _signature_ref.get(
@@ -194,6 +203,10 @@ if not DSES_MAPPING:
     st.error("The disease entropy signature mapping is empty.")
     st.stop()
 
+if not DSES_MAPPING:
+    st.error("The disease entropy signature mapping is empty.")
+    st.stop()
+
 # ============================================================
 # LOAD DISEASE-SPECIFIC ONE-VS-REST MODELS
 # ============================================================
@@ -233,11 +246,6 @@ if _missing_disease_models:
         "to the GitHub repository before running disease prediction."
     )
     st.stop()
-
-# Diagnostic summary: all disease-specific models are loaded.
-st.success(
-    f"✅ Loaded {len(_DSES_MODELS)} disease-specific DSES models."
-)
 
 
 # ============================================================
@@ -623,7 +631,7 @@ if run_dt:
 
     dg_metabolism = (
         -2870000
-        + GAS_CONSTANT_R * T * np.log(Q_metabolism)
+        + R * T * np.log(Q_metabolism)
     )
 
     Q_atp = soft_positive_input(
@@ -633,7 +641,7 @@ if run_dt:
 
     dg_atp = (
         -30500
-        + GAS_CONSTANT_R * T * np.log(Q_atp)
+        + R * T * np.log(Q_atp)
     )
 
     pH_factor = 10 ** (7.4 - ph)
@@ -644,7 +652,7 @@ if run_dt:
 
     dg_ion = (
         -50000
-        + GAS_CONSTANT_R * T * np.log(Q_ion)
+        + R * T * np.log(Q_ion)
     )
 
     calcium_factor = (
@@ -657,7 +665,7 @@ if run_dt:
 
     dg_calcium = (
         -50000
-        + GAS_CONSTANT_R * T * np.log(Q_calcium)
+        + R * T * np.log(Q_calcium)
     )
 
     redox_factor = spo2 / 100.0
@@ -668,7 +676,7 @@ if run_dt:
 
     dg_redox = (
         -220000
-        + GAS_CONSTANT_R * T * np.log(Q_redox)
+        + R * T * np.log(Q_redox)
     )
 
     no_factor = (
@@ -681,7 +689,7 @@ if run_dt:
 
     dg_no = (
         -100000
-        + GAS_CONSTANT_R * T * np.log(Q_no)
+        + R * T * np.log(Q_no)
     )
 
     total_dg = (
