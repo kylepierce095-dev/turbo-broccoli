@@ -402,15 +402,27 @@ def build_ml_row(disease_name, reaction_name):
 
 
 def prepare_model_input(raw_df):
+    """
+    Encode a single patient row for the DSES RF regressor.
+
+    CRITICAL FIX:
+    Never use drop_first=True on a single-row DataFrame.
+    With only one level present for Disease / Biochemical Reaction,
+    drop_first removes that level entirely. After reindex every
+    disease then collapses to the all-zero dummy block, so the RF
+    returns the identical Expected DSES for every disease.
+    """
     categorical = [
         c for c in DSES_CATEGORICAL_COLS
         if c in raw_df.columns
     ]
 
+    # Keep every level that appears; alignment to DSES_MODEL_COLUMNS
+    # will zero out any columns the training set dropped.
     encoded = pd.get_dummies(
         raw_df,
         columns=categorical,
-        drop_first=True,
+        drop_first=False,
         dtype=float,
     )
 
@@ -1425,7 +1437,6 @@ if run_dt:
     # ========================================================
     # RESULTS TABLE
     # ========================================================
-
 
     result_rows = []
 
