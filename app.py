@@ -131,6 +131,10 @@ DISEASE_REACTION_FACTORS = signature.get(
     "disease_reaction_factors",
     {},
 )
+DISEASE_SIGNATURE_SCALARS = signature.get(
+    "disease_signature_scalars",
+    {},
+)
 
 KNOWN_REACTIONS = {
     "Metabolism",
@@ -1146,18 +1150,23 @@ if run_dt:
     # ========================================================
     # PATIENT-CONDITIONED EXPECTED DSES
     #
-    # SINGLE RF MODEL:
-    #   RF predicts expected DSES for each
-    #   disease/reaction pair using the patient's
-    #   clinical parameters.
+    # The global RF was trained without an ATP Utilization
+    # reaction column and without every disease label. As a
+    # result many disease/reaction pairs collapse to the same
+    # RF vector. To keep Expected DSES unique per disease while
+    # still patient-conditioning:
     #
-    # Disease expected DSES = mean of its reaction-level
-    # RF predictions.
+    #   expected_d = disease_signature_scalar_d
+    #                + (RF_mean_d - median_RF_across_diseases)
+    #
+    # The signature scalar is the disease-specific center;
+    # the RF term shifts that center for THIS patient.
     # ========================================================
 
     expected_dses = {}
     expected_dses_uncertainty = {}
     expected_dses_details = {}
+    raw_rf_means = {}
 
     progress = st.progress(
         0,
@@ -1221,11 +1230,12 @@ if run_dt:
                     }
                 )
 
-        expected_dses[disease] = (
+        rf_mean = (
             float(np.mean(predictions))
             if predictions
             else np.nan
         )
+        raw_rf_means[disease] = rf_mean
 
         expected_dses_uncertainty[disease] = (
             float(np.mean(uncertainties))
@@ -1247,6 +1257,51 @@ if run_dt:
         )
 
     progress.empty()
+
+    # Patient-conditioning center = median RF prediction
+    # across diseases that produced a finite RF mean.
+    finite_rf = [
+        v for v in raw_rf_means.values()
+        if np.isfinite(v)
+    ]
+    rf_center = (
+        float(np.median(finite_rf))
+        if finite_rf
+        else 0.0
+    )
+
+    # Fall-back center for diseases with no scalar.
+    scalar_values = [
+        safe_float(v, np.nan)
+        for v in DISEASE_SIGNATURE_SCALARS.values()
+    ]
+    scalar_values = [
+        v for v in scalar_values
+        if np.isfinite(v) and v > 0
+    ]
+    median_scalar = (
+        float(np.median(scalar_values))
+        if scalar_values
+        else rf_center
+    )
+
+    for disease in diseases_sorted:
+        rf_mean = raw_rf_means.get(disease, np.nan)
+        scalar = safe_float(
+            DISEASE_SIGNATURE_SCALARS.get(
+                disease,
+                median_scalar,
+            ),
+            median_scalar,
+        )
+
+        if np.isfinite(rf_mean):
+            # Disease-specific center + patient shift from RF
+            expected_dses[disease] = float(
+                scalar + (rf_mean - rf_center)
+            )
+        else:
+            expected_dses[disease] = float(scalar)
 
     # ========================================================
     # DSES DISTANCE
@@ -1519,11 +1574,10 @@ if run_dt:
     st.header("DSES Disease Ranking")
 
     st.caption(
-        "The RF is used as a single-scalar DSES regressor: "
-        "it estimates the expected DSES for each disease/reaction "
-        "for this patient. The final ranking then compares the "
-        "patient's calculated DSES with that patient-conditioned "
-        "expected DSES."
+        "Expected DSES combines each disease's signature scalar "
+        "(unique disease center) with a patient-specific RF shift. "
+        "The ranking compares the patient's calculated DSES with "
+        "that patient-conditioned expected DSES."
     )
 
     display_cols = [
