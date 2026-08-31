@@ -73,6 +73,71 @@ def safe_float(value, default=0.0):
     except (TypeError, ValueError):
         return default
 
+# ============================================================
+# IMPROVED RANKING HELPERS (stability + standardised distance)
+# ============================================================
+
+def clip_finite(x, lo, hi):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return (lo + hi) / 2.0
+    if not np.isfinite(v):
+        return (lo + hi) / 2.0
+    return max(lo, min(hi, v))
+
+
+def scale_raw_dses(raw_dses, raw_min, raw_max, dses_low=1.0, dses_high=100.0):
+    """Map raw thermodynamic DSES into [dses_low, dses_high] with guards."""
+    raw = max(float(raw_dses), SOFT_FLOOR)
+    span = raw_max - raw_min
+    if not np.isfinite(span) or span <= SOFT_FLOOR:
+        return (dses_low + dses_high) / 2.0
+    scaled = dses_low + (raw - raw_min) * (dses_high - dses_low) / span
+    return clip_finite(scaled, dses_low, dses_high)
+
+
+def standardised_distance(patient_dses, expected_dses, rf_spread, min_spread=0.5):
+    """Distance / max(spread, min_spread) using RF predictive spread."""
+    dist = abs(float(patient_dses) - float(expected_dses))
+    spread = safe_float(rf_spread, min_spread)
+    spread = max(spread, min_spread)
+    return dist / spread
+
+
+def rank_states(patient_dses_dict, expected_dses_dict, spread_dict=None, min_spread=0.5):
+    """Return list of (disease, std_distance, abs_distance) sorted by std distance."""
+    if spread_dict is None:
+        spread_dict = {}
+    rows = []
+    for disease, p_dses in patient_dses_dict.items():
+        exp = expected_dses_dict.get(disease)
+        if exp is None or not np.isfinite(exp) or not np.isfinite(p_dses):
+            continue
+        abs_d = abs(p_dses - exp)
+        std_d = standardised_distance(p_dses, exp, spread_dict.get(disease), min_spread)
+        rows.append((disease, std_d, abs_d))
+    rows.sort(key=lambda x: (x[1], x[2]))
+    return rows
+
+
+def distances_to_probabilities(std_distances, temperature=1.0, df=3.0):
+    """Student-t style conversion of standardised distances to probabilities."""
+    if not std_distances:
+        return []
+    likes = []
+    for d in std_distances:
+        z = (d / max(temperature, 1e-6)) ** 2 / df
+        like = (1.0 + z) ** (-0.5 * (df + 1.0))
+        likes.append(max(like, 1e-300))
+    total = sum(likes)
+    if total <= 0:
+        n = len(likes)
+        return [1.0 / n] * n
+    return [l / total for l in likes]
+
+
+
 
 def load_artifact(filename, required=True):
     path = BASE_DIR / filename
@@ -875,6 +940,30 @@ if run_dt:
             expected_dses[disease] = float(scalar)
 
     # ========================================================
+
+    # ============================================================
+    # IMPROVED RANKING (standardised distance + Student-t probs)
+    # Uncomment / use this block instead of the raw absolute-distance
+    # ranking if you want uncertainty-aware ordering.
+    # ============================================================
+    #
+    # ranked = rank_states(
+    #     patient_dses,
+    #     expected_dses,
+    #     spread_dict=expected_dses_uncertainty,
+    #     min_spread=0.5,
+    # )
+    # if not ranked:
+    #     st.error("No valid states to rank.")
+    #     st.stop()
+    # top_disease, top_std_distance, top_abs_distance = ranked[0]
+    # std_distances = [r[1] for r in ranked]
+    # probs = distances_to_probabilities(std_distances, temperature=1.0, df=3.0)
+    # top_probability = probs[0]
+    #
+    # # Then continue with the existing display code using top_disease / top_probability
+    # ============================================================
+
     # DSES DISTANCE + PROBABILITY (includes Healthy)
     # ========================================================
 
