@@ -160,7 +160,7 @@ def load_artifact(filename, required=True):
 
 signature = load_artifact("disease_entropy_signature_reference.pkl")
 refs = load_artifact("dt_reference_values.pkl")
-DSES_RF_MODEL = load_artifact("dses_rf_model.joblib")
+DSES_RF_MODEL = load_artifact("dses_rf_model (8).joblib")
 DSES_MODEL_COLUMNS = load_artifact("dses_model_columns.joblib")
 DSES_MODEL_MEDIANS = load_artifact("dses_model_medians.joblib")
 DSES_CATEGORICAL_COLS = load_artifact("dses_categorical_columns.joblib")
