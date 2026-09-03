@@ -1,1 +1,1 @@
-PLACEHOLDER
+{"classes":["NORM","MI","STTC","CD","HYP"],"feature_columns":["P_Area_I","P_PeakTime_I"],"medians":{"P_Area_I":0.0,"P_PeakTime_I":0.0},"models":{"NORM":"PLACEHOLDER_MODEL","MI":"PLACEHOLDER_MODEL","STTC":"PLACEHOLDER_MODEL","CD":"PLACEHOLDER_MODEL","HYP":"PLACEHOLDER_MODEL"}}
