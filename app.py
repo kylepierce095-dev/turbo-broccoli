@@ -1,4 +1,4 @@
-
+# ============================================================
 # app.py
 # Cardiac DSES Digital Twin - FINAL 28-CLASS ARCHITECTURE
 #
@@ -58,18 +58,16 @@ BASE_DIR = (
 # 2. ROBUST MODEL / ARTIFACT PATHS
 # ============================================================
 
-# Python modules stay beside app.py.
-# Trained model artifacts may be stored either beside app.py
-# or inside the repository's pkl+joblib folder.
-
-ARTIFACT_DIRS = [
+# Python modules and trained artifacts may be stored either beside
+# app.py or inside the repository's pkl+joblib folder.
+SEARCH_DIRS = [
     BASE_DIR,
     BASE_DIR / "pkl+joblib",
 ]
 
-def resolve_artifact(filename):
-    """Return the first existing artifact path."""
-    for directory in ARTIFACT_DIRS:
+def resolve_file(filename):
+    """Return the first existing file in the supported runtime directories."""
+    for directory in SEARCH_DIRS:
         candidate = directory / filename
         if candidate.exists():
             return candidate
@@ -90,15 +88,19 @@ REQUIRED_ARTIFACTS = [
 ]
 
 missing = []
+resolved_modules = {}
 
 for filename in REQUIRED_MODULES:
-    if not (BASE_DIR / filename).exists():
+    path = resolve_file(filename)
+    if path is None:
         missing.append(filename)
+    else:
+        resolved_modules[filename] = path
 
 resolved_artifacts = {}
 
 for filename in REQUIRED_ARTIFACTS:
-    path = resolve_artifact(filename)
+    path = resolve_file(filename)
     if path is None:
         missing.append(f"pkl+joblib/{filename}")
     else:
@@ -111,7 +113,14 @@ for filename in REQUIRED_ARTIFACTS:
 
 if not missing:
     try:
-        sys.path.insert(0, str(BASE_DIR))
+        # Add the directories containing the runtime Python modules.
+        # This supports both repository layouts:
+        #   /app.py + /digital_twin.py + /ml_final_28class_FIXED.py
+        # and
+        #   /app.py + /pkl+joblib/{digital_twin.py, ml_final_28class_FIXED.py}
+        for module_path in resolved_modules.values():
+            if module_path.parent.exists():
+                sys.path.insert(0, str(module_path.parent))
 
         from digital_twin import (
             DISEASE_REACTION_MAP,
@@ -164,8 +173,8 @@ else:
     )
 
     st.write(
-        "Expected Python modules beside app.py and trained "
-        "model artifacts either beside app.py or in `pkl+joblib/`:"
+        "Expected Python modules and trained model artifacts either "
+        "beside app.py or inside `pkl+joblib/`:"
     )
 
     for filename in missing:
@@ -194,6 +203,12 @@ st.caption(
     "Final 28-class DSES model | Resting patient | Smoking fixed to NO"
 )
 
+with st.expander("Runtime file check", expanded=False):
+    st.write("Digital Twin:", str(resolved_modules["digital_twin.py"]))
+    st.write("Final ML module:", str(resolved_modules["ml_final_28class_FIXED.py"]))
+    for name, path in resolved_artifacts.items():
+        st.write(f"{name}:", str(path))
+
 
 # ============================================================
 # 5. REFERENCES / DISEASES
@@ -201,12 +216,37 @@ st.caption(
 
 @st.cache_resource(show_spinner=False)
 def get_references():
+    # If the Digital Twin module lives in pkl+joblib, its default
+    # reference workbook/cache are resolved relative to that folder.
+    dt_module_dir = resolved_modules["digital_twin.py"].parent
+
+    workbook_candidates = [
+        dt_module_dir / "Cardiac_Disease_Synchronized_Dataset_Patient_1_Literature_Conditioned_CLEAN (4).xlsx",
+        dt_module_dir / "Cardiac_Disease_Synchronized_Dataset_Patient_1_Literature_Conditioned_CLEAN (4)_2.xlsx",
+        BASE_DIR / "Cardiac_Disease_Synchronized_Dataset_Patient_1_Literature_Conditioned_CLEAN (4).xlsx",
+        BASE_DIR / "Cardiac_Disease_Synchronized_Dataset_Patient_1_Literature_Conditioned_CLEAN (4)_2.xlsx",
+    ]
+
+    workbook = next((p for p in workbook_candidates if p.exists()), None)
+
+    cache = dt_module_dir / "dt_reference_values.pkl"
+
+    if workbook is not None:
+        return build_or_load_references(
+            workbook_path=str(workbook),
+            cache_path=str(cache),
+        )
+
     return build_or_load_references()
 
 
 @st.cache_resource(show_spinner=False)
 def get_diseases():
-    return list(DISEASE_REACTION_MAP.keys())
+    return [
+        disease
+        for disease in DISEASE_REACTION_MAP.keys()
+        if str(disease).strip().lower() != "healthy"
+    ]
 
 
 try:
