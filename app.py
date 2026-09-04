@@ -1,293 +1,251 @@
+# ============================================================
+# app.py
+# Cardiac DSES Digital Twin - FINAL 28-CLASS ARCHITECTURE
+#
+# This app uses the final multiclass architecture:
+#
+#   Patient at rest
+#        ↓
+#   Digital Twin
+#        ↓
+#   28 Patient-DSES values
+#        +
+#   Conditional Expected-DSES RF
+#        ↓
+#   28 Expected-DSES values
+#        ↓
+#   28 DSES residuals
+#        +
+#   5 global stress features
+#        +
+#   5 Digital-Twin physiological features
+#        +
+#   compact clinical feature layer
+#        ↓
+#   Final 28-class ExtraTrees classifier
+#        ↓
+#   28 disease probabilities
+#
+# IMPORTANT:
+# - This replaces the older 50/50 DT + ML ranking.
+# - This replaces the older Student-t DSES-distance ranking.
+# - Disease is the prediction target, not a final classifier input.
+# - Patient is assumed to be at rest.
+# - Smoking is fixed to NO.
+# ============================================================
+
 from pathlib import Path
+import sys
+
 import numpy as np
 import pandas as pd
-import joblib
 import plotly.graph_objects as go
 import streamlit as st
 
+
 # ============================================================
-# STREAMLIT CONFIG
+# 1. ROBUST PATH
 # ============================================================
 
-st.set_page_config(
-    page_title="Cardio-Thermodynamic Digital Twin",
-    layout="wide",
+BASE_DIR = (
+    Path(__file__).resolve().parent
+    if "__file__" in globals()
+    else Path.cwd()
 )
 
-st.title("Cardio-Thermodynamic Digital Twin")
 
 # ============================================================
-# GLOBAL CONSTANTS / SAFE NUMERIC HELPERS
+# 2. REQUIRED FILE CHECK
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-SOFT_FLOOR = 1e-6
-DG_FLOOR = 1.0
-DEFAULT_TEMPERATURE_K = 310.15
-GAS_CONSTANT_R = 8.314
+REQUIRED_FILES = [
+    "digital_twin.py",
+    "ml_final_28class_FIXED.py",
+    "disease_dses_rf.joblib",
+    "disease_dses_model_columns.joblib",
+    "disease_dses_model_medians.joblib",
+    "final_28class_dses_classifier.joblib",
+    "final_28class_feature_columns.joblib",
+]
 
-# Healthy-state center on the same scale as disease_signature_scalars.
-# Disease scalars in the artifact range ~1–100; healthy is deliberately low.
-HEALTHY_LABEL = "Healthy"
-HEALTHY_SIGNATURE_SCALAR = 5.0
+missing = [
+    filename
+    for filename in REQUIRED_FILES
+    if not (BASE_DIR / filename).exists()
+]
 
 
-def soft_scalar(value, floor=SOFT_FLOOR):
+# ============================================================
+# 3. IMPORT MODEL MODULES
+# ============================================================
+
+if not missing:
     try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return float(floor)
-    if not np.isfinite(x) or x == 0:
-        return float(floor)
-    return x
+        # The existing final classifier module loads the Digital Twin
+        # itself. It is kept separate from Streamlit.
+        sys.path.insert(0, str(BASE_DIR))
 
-
-def soft_denominator(value, floor=SOFT_FLOOR):
-    if isinstance(value, pd.Series):
-        s = pd.to_numeric(value, errors="coerce")
-        return s.where(
-            s.notna() & np.isfinite(s) & (s != 0),
-            floor,
+        from digital_twin import (
+            DISEASE_REACTION_MAP,
+            build_or_load_references,
+            compute_patient_dses_scores,
         )
-    return soft_scalar(value, floor)
 
-
-def soft_positive_input(value, floor=SOFT_FLOOR):
-    if isinstance(value, pd.Series):
-        s = pd.to_numeric(value, errors="coerce")
-        return s.where(
-            s.notna() & np.isfinite(s) & (s > 0),
-            floor,
+        from ml_final_28class_FIXED import (
+            build_features,
+            predict_patient,
         )
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return float(floor)
-    return x if np.isfinite(x) and x > 0 else float(floor)
 
-
-def safe_float(value, default=0.0):
-    try:
-        x = float(value)
-        return x if np.isfinite(x) else default
-    except (TypeError, ValueError):
-        return default
-
-# ============================================================
-# IMPROVED RANKING HELPERS (stability + standardised distance)
-# ============================================================
-
-def clip_finite(x, lo, hi):
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return (lo + hi) / 2.0
-    if not np.isfinite(v):
-        return (lo + hi) / 2.0
-    return max(lo, min(hi, v))
-
-
-def scale_raw_dses(raw_dses, raw_min, raw_max, dses_low=1.0, dses_high=100.0):
-    """Map raw thermodynamic DSES into [dses_low, dses_high] with guards."""
-    raw = max(float(raw_dses), SOFT_FLOOR)
-    span = raw_max - raw_min
-    if not np.isfinite(span) or span <= SOFT_FLOOR:
-        return (dses_low + dses_high) / 2.0
-    scaled = dses_low + (raw - raw_min) * (dses_high - dses_low) / span
-    return clip_finite(scaled, dses_low, dses_high)
-
-
-def standardised_distance(patient_dses, expected_dses, rf_spread, min_spread=0.5):
-    """Distance / max(spread, min_spread) using RF predictive spread."""
-    dist = abs(float(patient_dses) - float(expected_dses))
-    spread = safe_float(rf_spread, min_spread)
-    spread = max(spread, min_spread)
-    return dist / spread
-
-
-def rank_states(patient_dses_dict, expected_dses_dict, spread_dict=None, min_spread=0.5):
-    """Return list of (disease, std_distance, abs_distance) sorted by std distance."""
-    if spread_dict is None:
-        spread_dict = {}
-    rows = []
-    for disease, p_dses in patient_dses_dict.items():
-        exp = expected_dses_dict.get(disease)
-        if exp is None or not np.isfinite(exp) or not np.isfinite(p_dses):
-            continue
-        abs_d = abs(p_dses - exp)
-        std_d = standardised_distance(p_dses, exp, spread_dict.get(disease), min_spread)
-        rows.append((disease, std_d, abs_d))
-    rows.sort(key=lambda x: (x[1], x[2]))
-    return rows
-
-
-def distances_to_probabilities(std_distances, temperature=1.0, df=3.0):
-    """Student-t style conversion of standardised distances to probabilities."""
-    if not std_distances:
-        return []
-    likes = []
-    for d in std_distances:
-        z = (d / max(temperature, 1e-6)) ** 2 / df
-        like = (1.0 + z) ** (-0.5 * (df + 1.0))
-        likes.append(max(like, 1e-300))
-    total = sum(likes)
-    if total <= 0:
-        n = len(likes)
-        return [1.0 / n] * n
-    return [l / total for l in likes]
-
-
-
-
-def load_artifact(filename, required=True):
-    path = BASE_DIR / filename
-    if not path.exists():
-        if required:
-            st.error(f"Required file not found: {filename}")
-            st.code(str(path))
-            st.stop()
-        return None
-    try:
-        return joblib.load(path)
     except Exception as exc:
-        st.error(f"Could not load {filename}: {exc}")
+        st.set_page_config(
+            page_title="Cardiac DSES Digital Twin",
+            layout="wide",
+        )
+        st.title("Cardiac DSES Digital Twin")
+        st.error(
+            "The 87% architecture could not be loaded."
+        )
+        st.exception(exc)
         st.stop()
-
-
-# ============================================================
-# LOAD EXISTING DSES ARTIFACTS
-# ============================================================
-
-signature = load_artifact("disease_entropy_signature_reference.pkl")
-refs = load_artifact("dt_reference_values.pkl")
-DSES_RF_MODEL = load_artifact("dses_rf_model (8).joblib")
-DSES_MODEL_COLUMNS = load_artifact("dses_model_columns.joblib")
-DSES_MODEL_MEDIANS = load_artifact("dses_model_medians.joblib")
-DSES_CATEGORICAL_COLS = load_artifact("dses_categorical_columns.joblib")
-
-if not isinstance(DSES_MODEL_COLUMNS, (list, tuple, np.ndarray, pd.Index)):
-    DSES_MODEL_COLUMNS = list(DSES_MODEL_COLUMNS)
-
-if not isinstance(DSES_MODEL_MEDIANS, dict):
-    try:
-        DSES_MODEL_MEDIANS = dict(DSES_MODEL_MEDIANS)
-    except Exception:
-        DSES_MODEL_MEDIANS = {}
-
-DSES_MODEL_COLUMNS = list(DSES_MODEL_COLUMNS)
-DSES_CATEGORICAL_COLS = list(DSES_CATEGORICAL_COLS or [])
-
-T = safe_float(
-    signature.get("temperature_K", DEFAULT_TEMPERATURE_K),
-    DEFAULT_TEMPERATURE_K,
-)
-if T <= 0:
-    T = DEFAULT_TEMPERATURE_K
-
-DSES_MAPPING_RAW = signature.get("mapping", {})
-REACTION_REFS = signature.get("reaction_references", {})
-DISEASE_REACTION_FACTORS = signature.get(
-    "disease_reaction_factors",
-    {},
-)
-DISEASE_SIGNATURE_SCALARS = dict(
-    signature.get("disease_signature_scalars", {}) or {}
-)
-# Inject Healthy so Expected DSES has a unique center for the healthy state.
-DISEASE_SIGNATURE_SCALARS[HEALTHY_LABEL] = HEALTHY_SIGNATURE_SCALAR
-
-KNOWN_REACTIONS = {
-    "Metabolism",
-    "ATP Utilization",
-    "Ion Transport",
-    "Calcium Handling",
-    "Redox Metabolism",
-    "Nitric Oxide Metabolism",
-}
-
-# ============================================================
-# NORMALIZE DISEASE -> REACTION MAPPING
-# ============================================================
-
-if set(DSES_MAPPING_RAW.keys()).intersection(KNOWN_REACTIONS):
-    DSES_MAPPING = {}
-    for reaction_name, disease_list in DSES_MAPPING_RAW.items():
-        if reaction_name not in KNOWN_REACTIONS:
-            continue
-        if disease_list is None:
-            continue
-        for disease_name in disease_list:
-            DSES_MAPPING.setdefault(
-                str(disease_name),
-                [],
-            ).append(str(reaction_name))
 else:
-    DSES_MAPPING = {
-        str(disease): list(reactions or [])
-        for disease, reactions in DSES_MAPPING_RAW.items()
-    }
+    st.set_page_config(
+        page_title="Cardiac DSES Digital Twin",
+        layout="wide",
+    )
+    st.title("Cardiac DSES Digital Twin")
 
-DSES_MAPPING = {
-    disease: sorted(set(reactions))
-    for disease, reactions in DSES_MAPPING.items()
-}
+    st.error(
+        "Required 87% architecture files are missing."
+    )
 
-# Healthy state: all known reactions at baseline (factor 1.0).
-# This lets the ranking include P(Healthy) alongside disease hypotheses.
-DSES_MAPPING[HEALTHY_LABEL] = sorted(KNOWN_REACTIONS)
-DISEASE_REACTION_FACTORS.setdefault(HEALTHY_LABEL, {})
-for rxn in KNOWN_REACTIONS:
-    DISEASE_REACTION_FACTORS[HEALTHY_LABEL].setdefault(rxn, 1.0)
+    st.write(
+        "Place these files in the same folder as app.py:"
+    )
 
-if not DSES_MAPPING:
-    st.error("The disease entropy signature mapping is empty.")
+    for filename in missing:
+        st.write(f"- `{filename}`")
+
     st.stop()
 
-st.success(
-    f"Loaded DSES model and {len(DSES_MAPPING)} states "
-    f"(including {HEALTHY_LABEL}). "
-    "No disease-specific RF classifier files are required."
+
+# ============================================================
+# 4. PAGE CONFIG
+# ============================================================
+
+# set_page_config may already have been called above in an error
+# branch. In normal execution, it has not been called yet.
+try:
+    st.set_page_config(
+        page_title="Cardiac DSES Digital Twin",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+except Exception:
+    pass
+
+st.title("Cardio-Thermodynamic Digital Twin")
+st.caption(
+    "Final 28-class DSES model | Resting patient | Smoking fixed to NO"
 )
 
+
 # ============================================================
-# PATIENT INPUTS
+# 5. REFERENCES / DISEASES
 # ============================================================
 
-st.header("Patient Input Parameters")
+@st.cache_resource(show_spinner=False)
+def get_references():
+    return build_or_load_references()
 
-c1, c2, c3 = st.columns(3)
 
-with c1:
-    hr = st.number_input(
-        "Heart Rate (bpm)",
-        min_value=20.0,
-        max_value=250.0,
-        value=72.0,
+@st.cache_resource(show_spinner=False)
+def get_diseases():
+    return list(DISEASE_REACTION_MAP.keys())
+
+
+try:
+    refs = get_references()
+    diseases = get_diseases()
+except Exception as exc:
+    st.error(
+        f"Could not load Digital Twin reference data: {exc}"
+    )
+    st.stop()
+
+
+# ============================================================
+# 6. SIDEBAR - PATIENT INPUT
+# ============================================================
+
+with st.sidebar:
+
+    st.header("Patient Input")
+
+    age = st.number_input(
+        "Age (years)",
+        min_value=18.0,
+        max_value=120.0,
+        value=55.0,
         step=1.0,
     )
+
+    sex = st.selectbox(
+        "Biological Sex",
+        ["Female", "Male"],
+    )
+
+    height = st.number_input(
+        "Height (cm)",
+        min_value=80.0,
+        max_value=230.0,
+        value=170.0,
+        step=0.1,
+    )
+
+    weight = st.number_input(
+        "Weight (kg)",
+        min_value=20.0,
+        max_value=250.0,
+        value=75.0,
+        step=0.1,
+    )
+
+    st.divider()
+
+    st.subheader("Hemodynamics")
+
+    hr = st.number_input(
+        "Resting Heart Rate (bpm)",
+        min_value=30.0,
+        max_value=200.0,
+        value=70.0,
+        step=1.0,
+    )
+
     sbp = st.number_input(
         "Systolic BP (mmHg)",
-        min_value=50.0,
+        min_value=70.0,
         max_value=250.0,
         value=120.0,
         step=1.0,
     )
+
     dbp = st.number_input(
         "Diastolic BP (mmHg)",
-        min_value=30.0,
-        max_value=150.0,
+        min_value=40.0,
+        max_value=160.0,
         value=80.0,
         step=1.0,
     )
 
-with c2:
     edv = st.number_input(
         "End-Diastolic Volume (mL)",
         min_value=20.0,
         max_value=500.0,
-        value=140.0,
+        value=150.0,
         step=1.0,
     )
+
     esv = st.number_input(
         "End-Systolic Volume (mL)",
         min_value=5.0,
@@ -295,1288 +253,842 @@ with c2:
         value=60.0,
         step=1.0,
     )
-    ph = st.number_input(
-        "pH",
-        min_value=6.5,
-        max_value=8.0,
-        value=7.40,
-        step=0.01,
-    )
 
-with c3:
-    spo2 = st.number_input(
-        "SpO₂ (%)",
-        min_value=50.0,
-        max_value=100.0,
-        value=98.0,
-        step=1.0,
-    )
-    fbs = st.number_input(
-        "Fasting Blood Sugar",
-        min_value=20.0,
-        max_value=600.0,
-        value=90.0,
-        step=1.0,
-    )
-    chol = st.number_input(
-        "Serum Cholesterol",
-        min_value=50.0,
-        max_value=600.0,
-        value=180.0,
-        step=1.0,
-    )
-
-# ============================================================
-# ADDITIONAL CLINICAL PARAMETERS
-# ============================================================
-
-st.header("Additional Clinical Parameters")
-
-c4, c5, c6 = st.columns(3)
-
-with c4:
-    age = st.number_input(
-        "Age (years)",
-        min_value=18.0,
-        max_value=81.0,
-        value=45.0,
-        step=1.0,
-    )
-    sex = st.selectbox(
-        "Biological Sex",
-        ["Female", "Male"],
-    )
-    height = st.number_input(
-        "Height (cm)",
-        min_value=150.0,
-        max_value=183.0,
-        value=165.0,
-        step=1.0,
-    )
-    weight = st.number_input(
-        "Weight (kg)",
-        min_value=45.0,
-        max_value=97.0,
-        value=70.0,
-        step=1.0,
-    )
-
-with c5:
-    cp = st.selectbox(
-        "Chest Pain Type",
-        [
-            "typical angina",
-            "atypical angina",
-            "non-anginal pain",
-            "asymptomatic",
-        ],
-    )
-    exang = st.selectbox(
-        "Exercise-Induced Angina",
-        ["No", "Yes"],
-    )
-    oldpeak = st.number_input(
-        "ST Depression (oldpeak)",
-        min_value=0.05,
-        max_value=4.34,
-        value=1.0,
-        step=0.05,
-    )
-    slope = st.selectbox(
-        "Slope of ST Segment",
-        ["Down", "Flat", "Up"],
-    )
-
-with c6:
-    ca = st.selectbox(
-        "Number of Major Vessels (ca)",
-        [0, 1, 2, 3],
-    )
-    # Standard thallium stress-test categories (Cleveland / clinical).
-    # Training data only contained "Normal", so the RF has no thal dummies;
-    # the UI must still expose the full clinical set.
-    thal = st.selectbox(
-        "Thallium Stress Test Result (thal)",
-        [
-            "Normal",
-            "Fixed defect",
-            "Reversible defect",
-        ],
-    )
-    restecg = st.selectbox(
-        "Resting ECG Result",
-        [
-            "Normal",
-            "ST-T wave abnormality",
-            "Left ventricular hypertrophy",
-        ],
-    )
     pawp = st.number_input(
         "PAWP (mmHg)",
-        min_value=5.06,
-        max_value=24.99,
+        min_value=0.0,
+        max_value=40.0,
         value=12.0,
-        step=0.5,
+        step=0.1,
     )
-    core_temp = st.number_input(
-        "Core Body Temperature (°C)",
-        min_value=36.3,
-        max_value=37.83,
-        value=36.9,
-        step=0.05,
-    )
-    myo_mass_input = st.number_input(
+
+    myocardial_mass = st.number_input(
         "Myocardial Mass (g)",
-        min_value=80.26,
-        max_value=239.89,
+        min_value=50.0,
+        max_value=500.0,
         value=150.0,
         step=1.0,
     )
 
-disease_choice = st.selectbox(
-    "Disease for per-reaction DSES inspection",
-    sorted(DSES_MAPPING.keys()),
-)
+    core_temp = st.number_input(
+        "Core Temperature (°C)",
+        min_value=34.0,
+        max_value=41.0,
+        value=37.0,
+        step=0.01,
+    )
 
-# ============================================================
-# ML INPUT
-# ============================================================
+    spo2 = st.number_input(
+        "SpO₂ (%)",
+        min_value=70.0,
+        max_value=100.0,
+        value=98.0,
+        step=0.1,
+    )
 
-def build_ml_row(disease_name, reaction_name):
-    return pd.DataFrame(
+    ph = st.number_input(
+        "Arterial pH",
+        min_value=6.8,
+        max_value=7.8,
+        value=7.40,
+        step=0.001,
+    )
+
+    fbs = st.number_input(
+        "Fasting Blood Sugar (mg/dL)",
+        min_value=50.0,
+        max_value=500.0,
+        value=90.0,
+        step=1.0,
+    )
+
+    chol = st.number_input(
+        "Serum Cholesterol (mg/dL)",
+        min_value=80.0,
+        max_value=500.0,
+        value=200.0,
+        step=1.0,
+    )
+
+    st.divider()
+
+    st.subheader("Clinical Phenotype")
+
+    chest_pain = st.selectbox(
+        "Chest Pain Type",
         [
-            {
-                "Age (mean)": age,
-                "Biological Sex": sex,
-                "Height (cm, mean)": height,
-                "Weight (kg, mean)": weight,
-                "Body Surface Area (BSA)": np.sqrt(
-                    (height * weight) / 3600.0
-                ),
-                "Heart Rate (bpm, mean/resting)": hr,
-                "Systolic Blood Pressure (mmHg, mean)": sbp,
-                "Diastolic Blood Pressure (mmHg, mean)": dbp,
-                "End-Diastolic Volume (EDV, mL, representative/mean)": edv,
-                "End-Systolic Volume (ESV, mL, representative/mean)": esv,
-                "EDV/ESV ratio": edv / soft_denominator(esv),
-                "Pulmonary Artery Wedge Pressure (PAWP, mmHg, representative/mean)": pawp,
-                "Myocardial Mass (g)": myo_mass_input,
-                "Core Body Temperature (°C, mean)": core_temp,
-                "SpO₂ (% , mean)": spo2,
-                "Arterial pH (pHₐ, mean)": ph,
-                "Chest Pain Type": cp,
-                "Exercise-Induced Angina": exang,
-                "ST Depression (oldpeak)": oldpeak,
-                "Slope of ST Segment": slope,
-                "Number of Major Vessels (ca)": ca,
-                "Thallium Stress Test Result (thal)": thal,
-                "Serum Cholesterol (mg/dL, mean)": chol,
-                "Fasting Blood Sugar (mg/dL, mean)": fbs,
-                "Resting ECG Result": restecg,
-                "Disease": disease_name,
-                "Biochemical Reaction": reaction_name,
-            }
-        ]
+            "asymptomatic",
+            "typical angina",
+            "atypical angina",
+            "non-anginal pain",
+        ],
     )
 
-
-def prepare_model_input(raw_df):
-    """
-    Encode a single patient row for the DSES RF regressor.
-
-    CRITICAL: do NOT use drop_first=True on a single-row frame.
-    With only one level present, drop_first removes that level
-    entirely → every disease collapses to the same RF input.
-    """
-    categorical = [
-        c for c in DSES_CATEGORICAL_COLS
-        if c in raw_df.columns
-    ]
-
-    encoded = pd.get_dummies(
-        raw_df,
-        columns=categorical,
-        drop_first=False,
-        dtype=float,
+    rest_ecg = st.selectbox(
+        "Resting ECG",
+        [
+            "Normal",
+            "Left ventricular hypertrophy",
+            "ST-T wave abnormality",
+        ],
     )
 
-    aligned = encoded.reindex(
-        columns=DSES_MODEL_COLUMNS,
-        fill_value=0.0,
+    run_button = st.button(
+        "RUN 28-CLASS MODEL",
+        type="primary",
+        use_container_width=True,
     )
-
-    for col in aligned.columns:
-        if aligned[col].isna().any():
-            aligned[col] = aligned[col].fillna(
-                safe_float(
-                    DSES_MODEL_MEDIANS.get(col, 0.0),
-                    0.0,
-                )
-            )
-
-    return aligned
-
-
-def rf_expected_dses_and_uncertainty(disease_name, reaction_name):
-    """
-    Single RF DSES regressor: predicts expected DSES for this
-    patient's clinical parameters under a disease/reaction pair.
-    Tree spread is only an uncertainty proxy.
-    """
-    # Healthy is not a trained Disease level — use a neutral disease
-    # label so clinical features still condition the RF.
-    rf_disease = (
-        "Heart block"
-        if disease_name == HEALTHY_LABEL
-        else disease_name
-    )
-
-    raw = build_ml_row(rf_disease, reaction_name)
-    x = prepare_model_input(raw)
-
-    mean_prediction = float(
-        DSES_RF_MODEL.predict(x)[0]
-    )
-
-    tree_predictions = []
-
-    if hasattr(DSES_RF_MODEL, "estimators_"):
-        for tree in DSES_RF_MODEL.estimators_:
-            try:
-                value = float(tree.predict(x)[0])
-                if np.isfinite(value):
-                    tree_predictions.append(value)
-            except Exception:
-                continue
-
-    if len(tree_predictions) >= 2:
-        uncertainty = float(
-            np.std(tree_predictions, ddof=1)
-        )
-    else:
-        uncertainty = np.nan
-
-    return mean_prediction, uncertainty
 
 
 # ============================================================
-# RUN
+# 7. PATIENT DICTIONARY
 # ============================================================
 
-run_dt = st.button(
-    "RUN DIGITAL TWIN",
-    type="primary",
-    use_container_width=True,
-)
+patient = {
+    "age": age,
+    "sex": sex,
+    "height_cm": height,
+    "weight_kg": weight,
+    "hr": hr,
+    "sbp": sbp,
+    "dbp": dbp,
+    "edv": edv,
+    "esv": esv,
+    "pawp": pawp,
+    "myocardial_mass_g": myocardial_mass,
+    "temp_c": core_temp,
+    "spo2": spo2,
+    "ph": ph,
+    "fbs": fbs,
+    "chol": chol,
+    "chest_pain": chest_pain,
+    "rest_ecg": rest_ecg,
+}
 
-if run_dt:
+
+# ============================================================
+# 8. RUN MODEL
+# ============================================================
+
+if run_button:
+
+    # --------------------------------------------------------
+    # Input validation
+    # --------------------------------------------------------
 
     if edv <= esv:
         st.error("EDV must be greater than ESV.")
         st.stop()
 
     if sbp <= dbp:
-        st.error("SBP must be greater than DBP.")
+        st.error("Systolic BP must be greater than DBP.")
         st.stop()
 
-    # ========================================================
-    # HEMODYNAMICS
-    # ========================================================
+    if height <= 0:
+        st.error("Height must be greater than zero.")
+        st.stop()
 
-    sv = edv - esv
-    ef = sv / soft_denominator(edv)
+    if weight <= 0:
+        st.error("Weight must be greater than zero.")
+        st.stop()
 
-    map_pressure = dbp + (sbp - dbp) / 3.0
-    co = sv * hr
-    rpp = hr * sbp
-    lvsw = sv * map_pressure * 0.000133322
+    # --------------------------------------------------------
+    # Run Digital Twin + final classifier
+    # --------------------------------------------------------
 
-    # ========================================================
-    # METABOLIC LAYER
-    # ========================================================
+    with st.spinner(
+        "Running Digital Twin and final 28-class classifier..."
+    ):
 
-    RPP_ref = 10000.0
-    LVSW_ref = 0.9
-    MVO2_rest = 8.0
-    O2_ENERGY = 20.2
-    MYOCARDIAL_MASS = myo_mass_input
-
-    rpp_component = rpp / soft_denominator(RPP_ref)
-    lvsw_component = lvsw / soft_denominator(LVSW_ref)
-    metabolic_demand = 0.7 * rpp_component + 0.3 * lvsw_component
-    mvo2 = MVO2_rest * metabolic_demand
-    o2_consumption = mvo2 * MYOCARDIAL_MASS / 100.0
-    chemical_power = o2_consumption * O2_ENERGY / 60.0
-    mechanical_power = lvsw * hr / 60.0
-    heat_production = max(chemical_power - mechanical_power, 0.0)
-
-    # ========================================================
-    # ATP
-    # ========================================================
-
-    ATP_ENERGY = 30500.0
-    ATP_COUPLING_EFFICIENCY = 0.60
-
-    atp_production = (
-        chemical_power * 60.0 * ATP_COUPLING_EFFICIENCY
-        / soft_denominator(ATP_ENERGY)
-    )
-    mechanical_energy = mechanical_power * 60.0
-    atp_utilization = mechanical_energy / soft_denominator(ATP_ENERGY)
-    atp_fraction = atp_utilization / soft_denominator(atp_production)
-    atp_balance = atp_production - atp_utilization
-
-    # ========================================================
-    # THERMODYNAMIC PROXY LAYER
-    # ========================================================
-
-    safe_atp_balance = soft_positive_input(atp_balance)
-
-    Q_metabolism = soft_positive_input(
-        ((fbs + 1.0) * chol)
-        / soft_denominator(spo2 * safe_atp_balance)
-    )
-    dg_metabolism = (
-        -2870000.0 + GAS_CONSTANT_R * T * np.log(Q_metabolism)
-    )
-
-    Q_atp = soft_positive_input(
-        atp_utilization / soft_denominator(atp_production)
-    )
-    dg_atp = -30500.0 + GAS_CONSTANT_R * T * np.log(Q_atp)
-
-    pH_factor = 10 ** (7.4 - ph)
-    Q_ion = soft_positive_input(atp_fraction * pH_factor)
-    dg_ion = -50000.0 + GAS_CONSTANT_R * T * np.log(Q_ion)
-
-    calcium_factor = ph * hr / soft_denominator(hr)
-    Q_calcium = soft_positive_input(atp_fraction * calcium_factor)
-    dg_calcium = -50000.0 + GAS_CONSTANT_R * T * np.log(Q_calcium)
-
-    redox_factor = spo2 / 100.0
-    Q_redox = soft_positive_input(atp_fraction * redox_factor)
-    dg_redox = -220000.0 + GAS_CONSTANT_R * T * np.log(Q_redox)
-
-    no_factor = ph * spo2 / 100.0
-    Q_no = soft_positive_input(atp_fraction * no_factor)
-    dg_no = -100000.0 + GAS_CONSTANT_R * T * np.log(Q_no)
-
-    total_dg = (
-        dg_metabolism + dg_atp + dg_ion
-        + dg_calcium + dg_redox + dg_no
-    )
-
-    # ========================================================
-    # ENTROPY FROM ENERGY / GIBBS BALANCE
-    # ========================================================
-
-    chem_input_j = chemical_power * 60.0
-    mech_work_j = mechanical_power * 60.0
-    heat_j = heat_production * 60.0
-
-    ion_energy = mech_work_j * atp_fraction
-    calcium_energy = mech_work_j * atp_fraction
-    redox_energy = chem_input_j * atp_fraction
-    no_energy = chem_input_j * atp_fraction
-
-    dG_dn_sum = 0.0
-
-    dn_metab = chem_input_j / max(abs(dg_metabolism), DG_FLOOR)
-    dG_dn_sum += dg_metabolism * dn_metab
-
-    dn_atp = atp_utilization
-    dG_dn_sum += dg_atp * dn_atp
-
-    dn_ion = ion_energy / max(abs(dg_ion), DG_FLOOR)
-    dG_dn_sum += dg_ion * dn_ion
-
-    dn_calcium = calcium_energy / max(abs(dg_calcium), DG_FLOOR)
-    dG_dn_sum += dg_calcium * dn_calcium
-
-    dn_redox = redox_energy / max(abs(dg_redox), DG_FLOOR)
-    dG_dn_sum += dg_redox * dn_redox
-
-    dn_no = no_energy / max(abs(dg_no), DG_FLOOR)
-    dG_dn_sum += dg_no * dn_no
-
-    entropy_flow = (chem_input_j + mech_work_j - dG_dn_sum) / T
-    entropy = entropy_flow
-
-    # ========================================================
-    # NORMALIZED STRESS FEATURES
-    # ========================================================
-
-    entropy_stress = (
-        entropy_flow / soft_denominator(refs["Entropy_Flow_median"])
-    )
-    metabolic_stress = (
-        mvo2 / soft_denominator(refs["MVO2_median"])
-    )
-    mechanical_stress = (
-        mechanical_power
-        / soft_denominator(refs["Mechanical_Power_median"])
-    )
-    thermodynamic_stress = (
-        abs(total_dg)
-        / soft_denominator(refs["Total_DG_abs_median"])
-    )
-    atp_stress = (
-        atp_fraction
-        / soft_denominator(refs["ATP_Utilization_Fraction_median"])
-    )
-
-    # ========================================================
-    # PATIENT REACTION-LEVEL DSES COMPONENTS
-    # ========================================================
-
-    reaction_values = {
-        "Metabolism": {"dg": dg_metabolism, "energy": chem_input_j},
-        "ATP Utilization": {"dg": dg_atp, "energy": mechanical_energy},
-        "Ion Transport": {"dg": dg_ion, "energy": ion_energy},
-        "Calcium Handling": {"dg": dg_calcium, "energy": calcium_energy},
-        "Redox Metabolism": {"dg": dg_redox, "energy": redox_energy},
-        "Nitric Oxide Metabolism": {"dg": dg_no, "energy": no_energy},
-    }
-
-    patient_components = {}
-
-    for reaction, vals in reaction_values.items():
-        if reaction not in REACTION_REFS:
-            continue
-
-        ref = REACTION_REFS[reaction]
-        dg_val = float(vals["dg"])
-        energy_val = float(vals["energy"])
-        dn_val = energy_val / max(abs(dg_val), DG_FLOOR)
-
-        reaction_entropy_flow = max(
-            abs(dg_val) * dn_val / T,
-            SOFT_FLOOR,
-        )
-
-        r_met = mvo2 / max(
-            safe_float(ref.get("mvo2_median", 1.0), 1.0),
-            SOFT_FLOOR,
-        )
-        r_mech = mechanical_power / max(
-            safe_float(ref.get("mechanical_power_median", 1.0), 1.0),
-            SOFT_FLOOR,
-        )
-        r_thermo = abs(dg_val) / max(
-            safe_float(ref.get("dg_abs_median", 1.0), 1.0),
-            SOFT_FLOOR,
-        )
-        r_atp = atp_fraction / max(
-            safe_float(ref.get("atp_fraction_median", 1.0), 1.0),
-            SOFT_FLOOR,
-        )
-        r_entropy = reaction_entropy_flow / max(
-            safe_float(ref.get("entropy_flow_median", 1.0), 1.0),
-            SOFT_FLOOR,
-        )
-
-        stress_values = [r_met, r_mech, r_thermo, r_atp, r_entropy]
-
-        patient_components[reaction] = {
-            "entropy_ratio": max(r_entropy, SOFT_FLOOR),
-            "stress_mean": max(float(np.mean(stress_values)), SOFT_FLOOR),
-            "metabolic_stress": r_met,
-            "mechanical_stress": r_mech,
-            "thermodynamic_stress": r_thermo,
-            "atp_stress": r_atp,
-            "entropy_stress": r_entropy,
-        }
-
-    # ========================================================
-    # PATIENT DSES FOR EVERY STATE (diseases + Healthy)
-    # ========================================================
-
-    patient_dses = {}
-    patient_dses_details = {}
-
-    raw_dses_min = safe_float(signature.get("raw_dses_min", 0.0), 0.0)
-    raw_dses_max = safe_float(signature.get("raw_dses_max", 100.0), 100.0)
-    dses_low = safe_float(signature.get("dses_range_low", 1.0), 1.0)
-    dses_high = safe_float(signature.get("dses_range_high", 100.0), 100.0)
-
-    for disease, reactions in DSES_MAPPING.items():
-        components = []
-        used_reactions = []
-
-        for reaction in reactions:
-            if reaction not in patient_components:
-                continue
-
-            factor = safe_float(
-                DISEASE_REACTION_FACTORS
-                .get(disease, {})
-                .get(reaction, 1.0),
-                1.0,
+        try:
+            dt_result = compute_patient_dses_scores(
+                patient,
+                refs,
             )
 
-            component_value = (
-                patient_components[reaction]["entropy_ratio"]
-                * patient_components[reaction]["stress_mean"]
-                * max(factor, SOFT_FLOOR)
+            final_predictions = predict_patient(
+                patient,
+                refs,
             )
-            components.append(component_value)
-            used_reactions.append(reaction)
 
-        raw_dses = max(
-            float(np.mean(components)) if components else SOFT_FLOOR,
-            SOFT_FLOOR,
+            # Build the same final feature vector used during
+            # final-classifier development so the intermediate
+            # DSES/stress/physiology features can be displayed.
+            model_input = pd.DataFrame([
+                {
+                    "Age_years": age,
+                    "Biological_Sex": sex,
+                    "Height_cm": height,
+                    "Weight_kg": weight,
+                    "Heart_Rate_bpm": hr,
+                    "Systolic_BP_mmHg": sbp,
+                    "Diastolic_BP_mmHg": dbp,
+                    "EDV_mL": edv,
+                    "ESV_mL": esv,
+                    "PAWP_mmHg": pawp,
+                    "Core_Temp_C": core_temp,
+                    "SpO2_pct": spo2,
+                    "pH": ph,
+                    "Fasting_Blood_Sugar": fbs,
+                    "Serum_Cholesterol": chol,
+                    "Myocardial_Mass_g": myocardial_mass,
+                    "Chest_Pain_Type": chest_pain,
+                    "Resting_ECG": rest_ecg,
+                }
+            ])
+
+            final_features = build_features(
+                model_input,
+                refs,
+            )
+
+        except Exception as exc:
+            st.error(
+                "Model execution failed."
+            )
+            st.exception(exc)
+            st.stop()
+
+    # ========================================================
+    # TOP PREDICTION
+    # ========================================================
+
+    top_row = final_predictions.iloc[0]
+
+    top_disease = str(
+        top_row["Disease"]
+    )
+
+    top_probability = float(
+        top_row["Probability"]
+    )
+
+    common = dt_result["common"]
+
+    # ========================================================
+    # TOP METRICS
+    # ========================================================
+
+    st.header("Final Prediction")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Predicted Disease",
+        top_disease,
+    )
+
+    c2.metric(
+        "Model Probability",
+        f"{top_probability:.2%}",
+    )
+
+    c3.metric(
+        "Stroke Volume",
+        f"{common['SV']:.2f} mL",
+    )
+
+    c4.metric(
+        "Ejection Fraction",
+        f"{common['EF'] * 100:.2f}%",
+    )
+
+    c5.metric(
+        "MAP",
+        f"{common['MAP']:.2f} mmHg",
+    )
+
+    st.success(
+        f"Top 28-class prediction: **{top_disease}** "
+        f"with model probability **{top_probability:.2%}**."
+    )
+
+    # ========================================================
+    # ARCHITECTURE PIPELINE
+    # ========================================================
+
+    st.header("87% Architecture")
+
+    pipeline = go.Figure(
+        go.Sankey(
+            node=dict(
+                label=[
+                    "Patient at Rest",
+                    "Digital Twin",
+                    "28 Patient DSES",
+                    "Expected-DSES RF",
+                    "28 Expected DSES",
+                    "28 DSES Residuals",
+                    "5 Global Stresses",
+                    "5 DT Physiology",
+                    "Clinical Layer",
+                    "Final 28-Class Classifier",
+                    "28 Disease Probabilities",
+                ]
+            ),
+            link=dict(
+                source=[
+                    0, 1, 2, 3, 4,
+                    5, 6, 7, 8, 9
+                ],
+                target=[
+                    1, 2, 3, 4, 5,
+                    6, 7, 8, 9, 10
+                ],
+                value=[1] * 10,
+            ),
         )
+    )
 
-        if raw_dses_max - raw_dses_min <= SOFT_FLOOR:
-            scaled_dses = (dses_low + dses_high) / 2.0
-        else:
-            scaled_dses = (
-                dses_low
-                + (
-                    (raw_dses - raw_dses_min)
-                    * (dses_high - dses_low)
-                    / (raw_dses_max - raw_dses_min)
-                )
-            )
+    pipeline.update_layout(
+        title="Final Cardiac DSES Prediction Pipeline",
+        height=400,
+    )
 
-        patient_dses[disease] = float(scaled_dses)
-        patient_dses_details[disease] = {
-            "raw_dses": raw_dses,
-            "mapped_reactions": reactions,
-            "used_reactions": used_reactions,
-            "missing_reactions": [
-                r for r in reactions if r not in used_reactions
-            ],
-        }
+    st.plotly_chart(
+        pipeline,
+        use_container_width=True,
+    )
 
     # ========================================================
-    # PATIENT-CONDITIONED EXPECTED DSES
-    #
-    # expected_d = disease_signature_scalar_d
-    #              + (RF_mean_d - median_RF_across_states)
+    # 28-CLASS RANKING TABLE
     # ========================================================
 
-    expected_dses = {}
-    expected_dses_uncertainty = {}
-    expected_dses_details = {}
-    raw_rf_means = {}
+    st.header("28-Class Disease Ranking")
 
-    progress = st.progress(
+    ranking = final_predictions.copy()
+
+    ranking.insert(
         0,
-        text="Calculating patient-conditioned expected DSES...",
-    )
-
-    diseases_sorted = sorted(DSES_MAPPING.keys())
-
-    for idx, disease in enumerate(diseases_sorted, start=1):
-        reactions = DSES_MAPPING.get(disease, [])
-        predictions = []
-        uncertainties = []
-        rows = []
-
-        for reaction in reactions:
-            try:
-                predicted, uncertainty = rf_expected_dses_and_uncertainty(
-                    disease, reaction
-                )
-                if np.isfinite(predicted):
-                    predictions.append(predicted)
-                if np.isfinite(uncertainty):
-                    uncertainties.append(uncertainty)
-                rows.append(
-                    {
-                        "Biochemical Reaction": reaction,
-                        "RF Expected DSES": predicted,
-                        "RF Predictive Spread": uncertainty,
-                    }
-                )
-            except Exception as exc:
-                rows.append(
-                    {
-                        "Biochemical Reaction": reaction,
-                        "RF Expected DSES": np.nan,
-                        "RF Predictive Spread": np.nan,
-                        "Error": str(exc),
-                    }
-                )
-
-        rf_mean = (
-            float(np.mean(predictions)) if predictions else np.nan
-        )
-        raw_rf_means[disease] = rf_mean
-        expected_dses_uncertainty[disease] = (
-            float(np.mean(uncertainties)) if uncertainties else np.nan
-        )
-        expected_dses_details[disease] = rows
-
-        progress.progress(
-            idx / max(len(diseases_sorted), 1),
-            text=f"Calculating expected DSES: {idx}/{len(diseases_sorted)}",
-        )
-
-    progress.empty()
-
-    finite_rf = [v for v in raw_rf_means.values() if np.isfinite(v)]
-    rf_center = float(np.median(finite_rf)) if finite_rf else 0.0
-
-    scalar_values = [
-        safe_float(v, np.nan)
-        for v in DISEASE_SIGNATURE_SCALARS.values()
-    ]
-    scalar_values = [v for v in scalar_values if np.isfinite(v) and v > 0]
-    median_scalar = (
-        float(np.median(scalar_values)) if scalar_values else rf_center
-    )
-
-    for disease in diseases_sorted:
-        rf_mean = raw_rf_means.get(disease, np.nan)
-        scalar = safe_float(
-            DISEASE_SIGNATURE_SCALARS.get(disease, median_scalar),
-            median_scalar,
-        )
-        if np.isfinite(rf_mean):
-            expected_dses[disease] = float(scalar + (rf_mean - rf_center))
-        else:
-            expected_dses[disease] = float(scalar)
-
-    # ========================================================
-
-    # ============================================================
-    # IMPROVED RANKING (standardised distance + Student-t probs)
-    # Uncomment / use this block instead of the raw absolute-distance
-    # ranking if you want uncertainty-aware ordering.
-    # ============================================================
-    #
-    # ranked = rank_states(
-    #     patient_dses,
-    #     expected_dses,
-    #     spread_dict=expected_dses_uncertainty,
-    #     min_spread=0.5,
-    # )
-    # if not ranked:
-    #     st.error("No valid states to rank.")
-    #     st.stop()
-    # top_disease, top_std_distance, top_abs_distance = ranked[0]
-    # std_distances = [r[1] for r in ranked]
-    # probs = distances_to_probabilities(std_distances, temperature=1.0, df=3.0)
-    # top_probability = probs[0]
-    #
-    # # Then continue with the existing display code using top_disease / top_probability
-    # ============================================================
-
-    # DSES DISTANCE + PROBABILITY (includes Healthy)
-    # ========================================================
-
-    valid_diseases = [
-        disease
-        for disease in diseases_sorted
-        if (
-            disease in patient_dses
-            and np.isfinite(expected_dses.get(disease, np.nan))
-        )
-    ]
-
-    if not valid_diseases:
-        st.error(
-            "No patient-conditioned expected DSES values could be calculated."
-        )
-        st.stop()
-
-    distances = {
-        disease: abs(patient_dses[disease] - expected_dses[disease])
-        for disease in valid_diseases
-    }
-
-    uncertainty_values = [
-        safe_float(expected_dses_uncertainty.get(disease, np.nan), np.nan)
-        for disease in valid_diseases
-    ]
-    positive_uncertainties = np.asarray(
-        [x for x in uncertainty_values if np.isfinite(x) and x > SOFT_FLOOR],
-        dtype=float,
-    )
-
-    expected_values = np.asarray(
-        [
-            expected_dses[d]
-            for d in valid_diseases
-            if np.isfinite(expected_dses[d])
-        ],
-        dtype=float,
-    )
-
-    if expected_values.size >= 2:
-        q1, q3 = np.percentile(expected_values, [25, 75])
-        expected_iqr = float(q3 - q1)
-        expected_mad = float(
-            np.median(np.abs(expected_values - np.median(expected_values)))
-        )
-    else:
-        expected_iqr = 0.0
-        expected_mad = 0.0
-
-    robust_rf_spread = (
-        float(np.median(positive_uncertainties))
-        if positive_uncertainties.size
-        else 0.0
-    )
-
-    uncertainty_floor_candidates = [
-        robust_rf_spread * 0.50,
-        expected_iqr * 0.25,
-        expected_mad * 1.4826,
-        1.0,
-    ]
-    uncertainty_floor = max(
-        [x for x in uncertainty_floor_candidates if np.isfinite(x)]
-        + [SOFT_FLOOR]
-    )
-
-    standardized_distances = {}
-    error_sources = {}
-
-    for disease in valid_diseases:
-        rf_spread = safe_float(
-            expected_dses_uncertainty.get(disease, np.nan), np.nan
-        )
-        if np.isfinite(rf_spread) and rf_spread > uncertainty_floor:
-            scale = float(rf_spread)
-            source = "Disease-specific RF tree spread"
-        else:
-            scale = float(uncertainty_floor)
-            source = "Robust uncertainty floor"
-
-        error_sources[disease] = {"scale": scale, "source": source}
-        standardized_distances[disease] = (
-            distances[disease] / max(scale, SOFT_FLOOR)
-        )
-
-    STUDENT_T_DF = 4.0
-    log_likelihoods = {}
-    for disease in valid_diseases:
-        z = standardized_distances[disease]
-        log_likelihoods[disease] = (
-            -0.5 * (STUDENT_T_DF + 1.0)
-            * np.log1p((z ** 2) / STUDENT_T_DF)
-        )
-
-    log_values = np.asarray(
-        [log_likelihoods[d] for d in valid_diseases], dtype=float
-    )
-    max_log = float(np.max(log_values))
-    exp_values = np.exp(log_values - max_log)
-    probability_denominator = float(np.sum(exp_values))
-
-    dses_probability = {}
-    for disease, exp_value in zip(valid_diseases, exp_values):
-        dses_probability[disease] = float(
-            exp_value / max(probability_denominator, SOFT_FLOOR)
-        )
-
-    dses_match_index = {
-        disease: float(1.0 / (1.0 + standardized_distances[disease] ** 2))
-        for disease in valid_diseases
-    }
-
-    # ========================================================
-    # RESULTS TABLE
-    # ========================================================
-
-    result_rows = []
-    for disease in valid_diseases:
-        result_rows.append(
-            {
-                "Disease": disease,
-                "Patient DSES": patient_dses[disease],
-                "Expected DSES (RF)": expected_dses[disease],
-                "DSES Distance": distances[disease],
-                "RF Predictive Spread": error_sources[disease]["scale"],
-                "Standardized Distance": standardized_distances[disease],
-                "DSES Relative Likelihood": float(
-                    np.exp(log_likelihoods[disease] - max_log)
-                ),
-                "DSES Probability": dses_probability[disease],
-                "DSES Match Index": dses_match_index[disease],
-            }
-        )
-
-    disease_results = (
-        pd.DataFrame(result_rows)
-        .sort_values("DSES Probability", ascending=False)
-        .reset_index(drop=True)
-    )
-    disease_results.insert(
-        0, "Rank", np.arange(1, len(disease_results) + 1)
-    )
-
-    top = disease_results.iloc[0]
-    top_disease = top["Disease"]
-    top_probability = top["DSES Probability"]
-    top_patient_dses = top["Patient DSES"]
-    top_expected_dses = top["Expected DSES (RF)"]
-    top_distance = top["DSES Distance"]
-    top_std_distance = top["Standardized Distance"]
-
-    healthy_row = disease_results[
-        disease_results["Disease"] == HEALTHY_LABEL
-    ]
-    healthy_probability = (
-        float(healthy_row["DSES Probability"].iloc[0])
-        if not healthy_row.empty
-        else np.nan
-    )
-
-    # ========================================================
-    # DIGITAL TWIN RESULTS
-    # ========================================================
-
-    st.header("Digital Twin Results")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Stroke Volume", f"{sv:.2f} mL")
-    m2.metric("Ejection Fraction", f"{ef * 100:.2f}%")
-    m3.metric("Entropy", f"{entropy:.4f} J/K")
-    m4.metric("Entropy Stress", f"{entropy_stress:.3f}")
-
-    # ========================================================
-    # MAIN RANKING (includes Healthy)
-    # ========================================================
-
-    st.header("DSES Disease Ranking")
-
-    st.caption(
-        "Expected DSES combines each state's signature scalar "
-        "(unique center, including Healthy) with a patient-specific "
-        "RF shift. Probabilities are normalized across all states "
-        "so they sum to 100%, including P(Healthy)."
-    )
-
-    display_cols = [
         "Rank",
-        "Disease",
-        "Patient DSES",
-        "Expected DSES (RF)",
-        "DSES Distance",
-        "RF Predictive Spread",
-        "Standardized Distance",
-        "DSES Probability",
-        "DSES Match Index",
-    ]
+        np.arange(
+            1,
+            len(ranking) + 1,
+        ),
+    )
+
+    ranking["Probability"] = (
+        ranking["Probability"] * 100.0
+    )
 
     st.dataframe(
-        disease_results[display_cols].style.format(
+        ranking[
+            [
+                "Rank",
+                "Disease",
+                "Probability",
+            ]
+        ].style.format(
             {
-                "Patient DSES": "{:.3f}",
-                "Expected DSES (RF)": "{:.3f}",
-                "DSES Distance": "{:.3f}",
-                "RF Predictive Spread": "{:.3f}",
-                "Standardized Distance": "{:.3f}",
-                "DSES Probability": "{:.2%}",
-                "DSES Match Index": "{:.3f}",
+                "Probability": "{:.2f}%",
             }
         ),
         use_container_width=True,
         hide_index=True,
     )
 
-    if top_disease == HEALTHY_LABEL:
-        st.success(
-            f"Top DSES-matched state: **Healthy** "
-            f"(DSES-derived probability = {top_probability:.2%})"
-        )
-    else:
-        st.success(
-            f"Top DSES-matched disease: {top_disease} "
-            f"(DSES-derived probability = {top_probability:.2%})"
-        )
-
-    if np.isfinite(healthy_probability):
-        st.info(
-            f"**Healthy-state probability** = {healthy_probability:.2%}  ·  "
-            f"Patient DSES = {top_patient_dses:.3f} | "
-            f"Expected DSES = {top_expected_dses:.3f} | "
-            f"Distance = {top_distance:.3f} | "
-            f"Standardized distance = {top_std_distance:.3f}"
-        )
-    else:
-        st.info(
-            f"Patient DSES = {top_patient_dses:.3f} | "
-            f"Expected DSES = {top_expected_dses:.3f} | "
-            f"Distance = {top_distance:.3f} | "
-            f"Standardized distance = {top_std_distance:.3f}"
-        )
-
-    if top_std_distance <= 0.5:
-        match_band = "Very high DSES match"
-    elif top_std_distance <= 1.0:
-        match_band = "High DSES match"
-    elif top_std_distance <= 2.0:
-        match_band = "Moderate DSES match"
-    elif top_std_distance <= 3.0:
-        match_band = "Low DSES match"
-    else:
-        match_band = "Very low DSES match"
-
-    st.caption(
-        f"Interpretation of the leading standardized distance: "
-        f"**{match_band}**. "
-        "This is a model-based DSES interpretation, not a diagnosis."
-    )
-
-    st.info(
-        "DSES-derived probability uses a Student-t distance likelihood "
-        "and uniform priors over all evaluated states (diseases + Healthy). "
-        "Probabilities sum to 100% across this candidate set. "
-        "This is NOT a clinically calibrated probability."
-    )
-
     # ========================================================
-    # CHARTS
+    # TOP 10 CHART
     # ========================================================
 
-    fig_compat = go.Figure(
+    top10 = (
+        ranking
+        .head(10)
+        .iloc[::-1]
+    )
+
+    fig_top10 = go.Figure(
         go.Bar(
-            x=disease_results["DSES Match Index"],
-            y=disease_results["Disease"],
+            x=top10["Probability"],
+            y=top10["Disease"],
             orientation="h",
         )
     )
-    fig_compat.update_layout(
-        title="Independent DSES Match Index by State",
-        xaxis_title="DSES Match Index (0–1, higher = closer)",
-        yaxis_title="State",
-        yaxis={
-            "categoryorder": "array",
-            "categoryarray": disease_results["Disease"].tolist(),
-        },
-    )
-    st.plotly_chart(fig_compat, use_container_width=True)
 
-    fig_probability = go.Figure(
+    fig_top10.update_layout(
+        title="Top 10 Final 28-Class Predictions",
+        xaxis_title="Classifier Probability (%)",
+        yaxis_title="Disease",
+        height=520,
+    )
+
+    st.plotly_chart(
+        fig_top10,
+        use_container_width=True,
+    )
+
+    # ========================================================
+    # PATIENT DSES / EXPECTED DSES / RESIDUALS
+    # ========================================================
+
+    st.header(
+        "DSES Features Used by the Final Classifier"
+    )
+
+    dses_rows = []
+
+    for disease in diseases:
+
+        p_col = f"P_{disease}"
+        e_col = f"E_{disease}"
+        r_col = f"R_{disease}"
+
+        dses_rows.append(
+            {
+                "Disease": disease,
+                "Patient DSES": (
+                    float(
+                        final_features.iloc[0][p_col]
+                    )
+                    if p_col in final_features.columns
+                    else np.nan
+                ),
+                "Expected DSES": (
+                    float(
+                        final_features.iloc[0][e_col]
+                    )
+                    if e_col in final_features.columns
+                    else np.nan
+                ),
+                "DSES Residual": (
+                    float(
+                        final_features.iloc[0][r_col]
+                    )
+                    if r_col in final_features.columns
+                    else np.nan
+                ),
+            }
+        )
+
+    dses_table = pd.DataFrame(
+        dses_rows
+    )
+
+    dses_table = dses_table.merge(
+        final_predictions,
+        on="Disease",
+        how="left",
+    )
+
+    dses_table["Probability"] = (
+        dses_table["Probability"] * 100.0
+    )
+
+    dses_table = (
+        dses_table
+        .sort_values(
+            "Probability",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    dses_table.insert(
+        0,
+        "Rank",
+        np.arange(
+            1,
+            len(dses_table) + 1,
+        ),
+    )
+
+    st.dataframe(
+        dses_table.style.format(
+            {
+                "Patient DSES": "{:.3f}",
+                "Expected DSES": "{:.3f}",
+                "DSES Residual": "{:.3f}",
+                "Probability": "{:.2f}%",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ========================================================
+    # PATIENT VS EXPECTED DSES
+    # ========================================================
+
+    fig_dses = go.Figure()
+
+    selected_dses = (
+        dses_table
+        .head(10)
+        .iloc[::-1]
+    )
+
+    fig_dses.add_trace(
         go.Bar(
-            x=disease_results["DSES Probability"] * 100.0,
-            y=disease_results["Disease"],
+            x=selected_dses["Patient DSES"],
+            y=selected_dses["Disease"],
+            orientation="h",
+            name="Patient DSES",
+        )
+    )
+
+    fig_dses.add_trace(
+        go.Bar(
+            x=selected_dses["Expected DSES"],
+            y=selected_dses["Disease"],
+            orientation="h",
+            name="Expected DSES",
+        )
+    )
+
+    fig_dses.update_layout(
+        title="Patient DSES vs Expected DSES - Top 10",
+        xaxis_title="DSES",
+        yaxis_title="Disease",
+        barmode="group",
+        height=520,
+    )
+
+    st.plotly_chart(
+        fig_dses,
+        use_container_width=True,
+    )
+
+    # ========================================================
+    # DSES RESIDUAL CHART
+    # ========================================================
+
+    residual_plot = (
+        dses_table
+        .head(15)
+        .iloc[::-1]
+    )
+
+    fig_residual = go.Figure(
+        go.Bar(
+            x=residual_plot["DSES Residual"],
+            y=residual_plot["Disease"],
             orientation="h",
         )
     )
-    fig_probability.update_layout(
-        title="DSES-Derived State Probability (includes Healthy)",
-        xaxis_title="DSES-derived probability (%)",
-        yaxis_title="State",
-        xaxis={"range": [0, 100]},
-        yaxis={
-            "categoryorder": "array",
-            "categoryarray": disease_results["Disease"].tolist(),
-        },
-    )
-    st.plotly_chart(fig_probability, use_container_width=True)
 
-    fig_distance = go.Figure(
-        go.Bar(
-            x=disease_results["Disease"],
-            y=disease_results["DSES Distance"],
+    fig_residual.add_vline(
+        x=0,
+        line_dash="dash",
+    )
+
+    fig_residual.update_layout(
+        title="DSES Residuals - Top 15 Predicted Diseases",
+        xaxis_title="Patient DSES - Expected DSES",
+        yaxis_title="Disease",
+        height=620,
+    )
+
+    st.plotly_chart(
+        fig_residual,
+        use_container_width=True,
+    )
+
+    # ========================================================
+    # GLOBAL STRESS FEATURES
+    # ========================================================
+
+    st.header("Global Digital-Twin Stress Features")
+
+    stress_names = [
+        "Metabolic Stress",
+        "Mechanical Stress",
+        "Thermodynamic Stress",
+        "ATP Stress",
+        "Entropy Stress",
+    ]
+
+    stress_values = []
+
+    for name in stress_names:
+        column = f"G_{name}"
+
+        stress_values.append(
+            float(
+                final_features.iloc[0].get(
+                    column,
+                    np.nan,
+                )
+            )
         )
-    )
-    fig_distance.update_layout(
-        title="Patient DSES vs Patient-Conditioned Expected DSES",
-        xaxis_title="State",
-        yaxis_title="Absolute DSES Distance",
-        xaxis={"tickangle": -60},
-    )
-    st.plotly_chart(fig_distance, use_container_width=True)
-
-    fig_std = go.Figure(
-        go.Bar(
-            x=disease_results["Disease"],
-            y=disease_results["Standardized Distance"],
-        )
-    )
-    fig_std.add_hline(
-        y=1.0, line_dash="dash", annotation_text="1 RF-spread unit"
-    )
-    fig_std.update_layout(
-        title="Uncertainty-Adjusted DSES Distance",
-        xaxis_title="State",
-        yaxis_title="Standardized Distance",
-        xaxis={"tickangle": -60},
-    )
-    st.plotly_chart(fig_std, use_container_width=True)
-
-    # ========================================================
-    # WHY TOP RANKED
-    # ========================================================
-
-    st.header("Why Was This State Ranked First?")
-    st.write(
-        f"**{top_disease}** has the smallest uncertainty-adjusted "
-        f"mismatch between the patient's DSES and the patient-conditioned "
-        f"expected DSES. Absolute distance = **{top_distance:.3f}**, "
-        f"standardized distance = **{top_std_distance:.3f}**, "
-        f"model probability = **{top_probability:.2%}**."
-    )
-
-    # ========================================================
-    # STRESS PROFILE
-    # ========================================================
-
-    st.subheader("Patient Stress Profile")
 
     stress_df = pd.DataFrame(
         {
-            "Stress Component": [
-                "Metabolic Stress",
-                "Mechanical Stress",
-                "Thermodynamic Stress",
-                "ATP Stress",
-                "Entropy Stress",
-            ],
-            "Value": [
-                metabolic_stress,
-                mechanical_stress,
-                thermodynamic_stress,
-                atp_stress,
-                entropy_stress,
-            ],
+            "Stress Component": stress_names,
+            "Value": stress_values,
         }
     )
+
     st.dataframe(
-        stress_df.style.format({"Value": "{:.4f}"}),
+        stress_df.style.format(
+            {"Value": "{:.4f}"}
+        ),
         use_container_width=True,
         hide_index=True,
     )
 
     fig_stress = go.Figure(
-        go.Bar(x=stress_df["Stress Component"], y=stress_df["Value"])
+        go.Bar(
+            x=stress_df["Stress Component"],
+            y=stress_df["Value"],
+        )
     )
+
     fig_stress.add_hline(
-        y=1.0, line_dash="dash", annotation_text="Reference = 1.0"
+        y=1.0,
+        line_dash="dash",
+        annotation_text="Reference = 1.0",
     )
+
     fig_stress.update_layout(
-        title=f"Patient Stress Profile Supporting {top_disease}",
-        xaxis_title="Stress Component",
-        yaxis_title="Normalized Stress",
+        title="Global Stress Profile",
+        xaxis_title="Stress",
+        yaxis_title="Normalized Value",
     )
-    st.plotly_chart(fig_stress, use_container_width=True)
+
+    st.plotly_chart(
+        fig_stress,
+        use_container_width=True,
+    )
 
     # ========================================================
-    # TOP STATE REACTION EXPLANATION
+    # DIGITAL TWIN PHYSIOLOGY
     # ========================================================
 
-    st.subheader(f"{top_disease}: Reaction-Level DSES Explanation")
+    st.header("Digital Twin Physiological State")
 
-    top_reactions = DSES_MAPPING.get(top_disease, [])
-    explanation_rows = []
+    physiology_rows = [
+        (
+            "Stroke Volume",
+            common["SV"],
+            "mL",
+        ),
+        (
+            "Ejection Fraction",
+            common["EF"] * 100.0,
+            "%",
+        ),
+        (
+            "Mean Arterial Pressure",
+            common["MAP"],
+            "mmHg",
+        ),
+        (
+            "Cardiac Output",
+            common["CO"],
+            "mL/min proxy",
+        ),
+        (
+            "Rate-Pressure Product",
+            common["RPP"],
+            "mmHg·bpm",
+        ),
+        (
+            "LV Stroke Work",
+            common["LVSW"],
+            "J/beat",
+        ),
+        (
+            "MVO₂",
+            common["MVO2"],
+            "DT units",
+        ),
+        (
+            "Chemical Power",
+            common["Chemical Power (W)"],
+            "W",
+        ),
+        (
+            "Mechanical Power",
+            common["Mechanical Power (W)"],
+            "W",
+        ),
+        (
+            "Heat Production",
+            common["Heat Production (W)"],
+            "W",
+        ),
+        (
+            "ATP Production",
+            common["ATP Production (mol/min)"],
+            "mol/min",
+        ),
+        (
+            "ATP Utilization",
+            common["ATP Utilization (mol/min)"],
+            "mol/min",
+        ),
+        (
+            "ATP Utilization Fraction",
+            common["ATP Utilization Fraction"],
+            "ratio",
+        ),
+        (
+            "ATP Balance",
+            common["ATP Balance (mol/min)"],
+            "mol/min",
+        ),
+    ]
 
-    for reaction in top_reactions:
-        if reaction not in patient_components:
-            continue
+    physiology_df = pd.DataFrame(
+        physiology_rows,
+        columns=[
+            "Variable",
+            "Value",
+            "Unit",
+        ],
+    )
 
-        component = patient_components[reaction]
-        factor = safe_float(
-            DISEASE_REACTION_FACTORS
-            .get(top_disease, {})
-            .get(reaction, 1.0),
-            1.0,
-        )
-        component_dses = (
-            component["entropy_ratio"]
-            * component["stress_mean"]
-            * max(factor, SOFT_FLOOR)
-        )
-
-        expected_value = np.nan
-        expected_spread = np.nan
-        for row in expected_dses_details.get(top_disease, []):
-            if row.get("Biochemical Reaction") == reaction:
-                expected_value = row.get("RF Expected DSES", np.nan)
-                expected_spread = row.get("RF Predictive Spread", np.nan)
-                break
-
-        explanation_rows.append(
-            {
-                "Biochemical Reaction": reaction,
-                "Metabolic Stress": component["metabolic_stress"],
-                "Mechanical Stress": component["mechanical_stress"],
-                "Thermodynamic Stress": component["thermodynamic_stress"],
-                "ATP Stress": component["atp_stress"],
-                "Entropy Stress": component["entropy_stress"],
-                "Entropy Ratio": component["entropy_ratio"],
-                "Disease Factor": factor,
-                "Patient DSES Component": component_dses,
-                "RF Expected DSES": expected_value,
-                "RF Predictive Spread": expected_spread,
-            }
-        )
-
-    explanation_df = pd.DataFrame(explanation_rows)
-
-    if not explanation_df.empty:
-        st.dataframe(
-            explanation_df.style.format(
-                {
-                    "Metabolic Stress": "{:.3f}",
-                    "Mechanical Stress": "{:.3f}",
-                    "Thermodynamic Stress": "{:.3f}",
-                    "ATP Stress": "{:.3f}",
-                    "Entropy Stress": "{:.3f}",
-                    "Entropy Ratio": "{:.3f}",
-                    "Disease Factor": "{:.3f}",
-                    "Patient DSES Component": "{:.3f}",
-                    "RF Expected DSES": "{:.3f}",
-                    "RF Predictive Spread": "{:.3f}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        fig_reaction = go.Figure()
-        fig_reaction.add_bar(
-            x=explanation_df["Biochemical Reaction"],
-            y=explanation_df["Patient DSES Component"],
-            name="Patient DSES Component",
-        )
-        fig_reaction.add_bar(
-            x=explanation_df["Biochemical Reaction"],
-            y=explanation_df["RF Expected DSES"],
-            name="RF Expected DSES",
-        )
-        fig_reaction.update_layout(
-            title=f"Patient DSES Component vs RF Expected DSES — {top_disease}",
-            xaxis_title="Biochemical Reaction",
-            yaxis_title="DSES",
-            barmode="group",
-        )
-        st.plotly_chart(fig_reaction, use_container_width=True)
-
-    # ========================================================
-    # PER-REACTION RF INSPECTION
-    # ========================================================
-
-    with st.expander("Show Patient-Conditioned RF Expected DSES"):
-        selected_reactions = DSES_MAPPING.get(disease_choice, [])
-        inspection_rows = []
-        for reaction in selected_reactions:
-            try:
-                predicted, uncertainty = rf_expected_dses_and_uncertainty(
-                    disease_choice, reaction
-                )
-                inspection_rows.append(
-                    {
-                        "Biochemical Reaction": reaction,
-                        "RF Expected DSES": predicted,
-                        "RF Predictive Spread": uncertainty,
-                    }
-                )
-            except Exception as exc:
-                inspection_rows.append(
-                    {
-                        "Biochemical Reaction": reaction,
-                        "RF Expected DSES": np.nan,
-                        "RF Predictive Spread": np.nan,
-                        "Error": str(exc),
-                    }
-                )
-        st.dataframe(
-            pd.DataFrame(inspection_rows).style.format(
-                {
-                    "RF Expected DSES": "{:.3f}",
-                    "RF Predictive Spread": "{:.3f}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # ========================================================
-    # DIGITAL TWIN CALCULATIONS
-    # ========================================================
-
-    with st.expander("Show Digital Twin Calculations"):
-        calculation_df = pd.DataFrame(
-            {
-                "Variable": [
-                    "Temperature (K)",
-                    "Heart Rate",
-                    "SBP",
-                    "DBP",
-                    "EDV",
-                    "ESV",
-                    "pH",
-                    "SpO₂",
-                    "Fasting Blood Sugar",
-                    "Cholesterol",
-                    "Stroke Volume",
-                    "Ejection Fraction",
-                    "MAP",
-                    "Cardiac Output",
-                    "RPP",
-                    "LV Stroke Work",
-                    "MVO₂",
-                    "Chemical Power",
-                    "Mechanical Power",
-                    "Heat Production",
-                    "ATP Production",
-                    "ATP Utilization",
-                    "ATP Fraction",
-                    "ATP Balance",
-                    "Entropy Flow",
-                    "Entropy",
-                    "Entropy Stress",
-                    "Metabolic Stress",
-                    "Mechanical Stress",
-                    "Thermodynamic Stress",
-                    "ATP Stress",
-                    "Total ΔG",
-                ],
-                "Value": [
-                    T, hr, sbp, dbp, edv, esv, ph, spo2, fbs, chol,
-                    sv, ef, map_pressure, co, rpp, lvsw, mvo2,
-                    chemical_power, mechanical_power, heat_production,
-                    atp_production, atp_utilization, atp_fraction,
-                    atp_balance, entropy_flow, entropy, entropy_stress,
-                    metabolic_stress, mechanical_stress,
-                    thermodynamic_stress, atp_stress, total_dg,
-                ],
-            }
-        )
-        st.dataframe(
-            calculation_df.style.format({"Value": "{:.6f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # ========================================================
-    # FULL DETAILS
-    # ========================================================
-
-    st.subheader("Full State DSES / Distance Details")
     st.dataframe(
-        disease_results[
-            [
-                "Rank",
-                "Disease",
-                "Patient DSES",
-                "Expected DSES (RF)",
-                "DSES Distance",
-                "RF Predictive Spread",
-                "Standardized Distance",
-                "DSES Relative Likelihood",
-                "DSES Probability",
-                "DSES Match Index",
-            ]
-        ].style.format(
-            {
-                "Patient DSES": "{:.3f}",
-                "Expected DSES (RF)": "{:.3f}",
-                "DSES Distance": "{:.3f}",
-                "RF Predictive Spread": "{:.3f}",
-                "Standardized Distance": "{:.3f}",
-                "DSES Relative Likelihood": "{:.3f}",
-                "DSES Probability": "{:.2%}",
-                "DSES Match Index": "{:.3f}",
-            }
+        physiology_df.style.format(
+            {"Value": "{:.6f}"}
         ),
         use_container_width=True,
         hide_index=True,
+    )
+
+    # ========================================================
+    # REACTION-LEVEL DETAIL FOR TOP DISEASE
+    # ========================================================
+
+    st.header(
+        f"Reaction-Level Detail — {top_disease}"
+    )
+
+    top_reaction_details = (
+        dt_result
+        .get("reaction_details", {})
+        .get(top_disease, {})
+    )
+
+    reaction_rows = []
+
+    for reaction, detail in top_reaction_details.items():
+
+        row = {
+            "Biochemical Reaction": reaction
+        }
+
+        if isinstance(detail, dict):
+            row.update(detail)
+
+        reaction_rows.append(row)
+
+    if reaction_rows:
+
+        reaction_df = pd.DataFrame(
+            reaction_rows
+        )
+
+        st.dataframe(
+            reaction_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.info(
+            "No reaction-level details were available "
+            "for the top predicted disease."
+        )
+
+    # ========================================================
+    # FULL DIGITAL-TWIN CALCULATION DETAILS
+    # ========================================================
+
+    with st.expander(
+        "Show Full Digital-Twin Calculations"
+    ):
+
+        calculation = []
+
+        for key, value in common.items():
+
+            if isinstance(
+                value,
+                (int, float, np.integer, np.floating),
+            ):
+
+                calculation.append(
+                    {
+                        "Variable": key,
+                        "Value": float(value),
+                    }
+                )
+
+        calculation_df = pd.DataFrame(
+            calculation
+        )
+
+        if not calculation_df.empty:
+            st.dataframe(
+                calculation_df.style.format(
+                    {"Value": "{:.8f}"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ========================================================
+    # MODEL FEATURE COUNT
+    # ========================================================
+
+    with st.expander(
+        "Show Final Classifier Feature Summary"
+    ):
+
+        feature_summary = pd.DataFrame(
+            {
+                "Feature Group": [
+                    "Patient DSES",
+                    "Expected DSES",
+                    "DSES residuals",
+                    "Global stress summaries",
+                    "DT physiological features",
+                    "Compact clinical layer",
+                ],
+                "Features": [
+                    28,
+                    28,
+                    28,
+                    5,
+                    5,
+                    12,
+                ],
+                "Total": [
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    106,
+                ],
+            }
+        )
+
+        st.dataframe(
+            feature_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "The compact clinical layer contains the raw patient "
+            "fields used by the final model after categorical encoding."
+        )
+
+    # ========================================================
+    # MODEL INTERPRETATION NOTICE
+    # ========================================================
+
+    st.info(
+        "The displayed probabilities come from the trained final "
+        "28-class classifier. They are model probabilities, not "
+        "clinically calibrated diagnostic probabilities."
+    )
+
+else:
+
+    st.info(
+        "Enter the patient's resting parameters in the sidebar "
+        "and click **RUN 28-CLASS MODEL**."
     )
