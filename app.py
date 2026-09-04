@@ -1,4 +1,4 @@
-# ============================================================
+
 # app.py
 # Cardiac DSES Digital Twin - FINAL 28-CLASS ARCHITECTURE
 #
@@ -55,12 +55,33 @@ BASE_DIR = (
 
 
 # ============================================================
-# 2. REQUIRED FILE CHECK
+# 2. ROBUST MODEL / ARTIFACT PATHS
 # ============================================================
 
-REQUIRED_FILES = [
+# Python modules stay beside app.py.
+# Trained model artifacts may be stored either beside app.py
+# or inside the repository's pkl+joblib folder.
+
+ARTIFACT_DIRS = [
+    BASE_DIR,
+    BASE_DIR / "pkl+joblib",
+]
+
+def resolve_artifact(filename):
+    """Return the first existing artifact path."""
+    for directory in ARTIFACT_DIRS:
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+REQUIRED_MODULES = [
     "digital_twin.py",
     "ml_final_28class_FIXED.py",
+]
+
+REQUIRED_ARTIFACTS = [
     "disease_dses_rf.joblib",
     "disease_dses_model_columns.joblib",
     "disease_dses_model_medians.joblib",
@@ -68,11 +89,20 @@ REQUIRED_FILES = [
     "final_28class_feature_columns.joblib",
 ]
 
-missing = [
-    filename
-    for filename in REQUIRED_FILES
-    if not (BASE_DIR / filename).exists()
-]
+missing = []
+
+for filename in REQUIRED_MODULES:
+    if not (BASE_DIR / filename).exists():
+        missing.append(filename)
+
+resolved_artifacts = {}
+
+for filename in REQUIRED_ARTIFACTS:
+    path = resolve_artifact(filename)
+    if path is None:
+        missing.append(f"pkl+joblib/{filename}")
+    else:
+        resolved_artifacts[filename] = path
 
 
 # ============================================================
@@ -81,8 +111,6 @@ missing = [
 
 if not missing:
     try:
-        # The existing final classifier module loads the Digital Twin
-        # itself. It is kept separate from Streamlit.
         sys.path.insert(0, str(BASE_DIR))
 
         from digital_twin import (
@@ -91,10 +119,27 @@ if not missing:
             compute_patient_dses_scores,
         )
 
-        from ml_final_28class_FIXED import (
-            build_features,
-            predict_patient,
-        )
+        import ml_final_28class_FIXED as _ml_runtime
+
+        # Point the runtime module at the actual artifact locations.
+        _ml_runtime.RF_PATH = resolved_artifacts[
+            "disease_dses_rf.joblib"
+        ]
+        _ml_runtime.RF_COLS = resolved_artifacts[
+            "disease_dses_model_columns.joblib"
+        ]
+        _ml_runtime.RF_MED = resolved_artifacts[
+            "disease_dses_model_medians.joblib"
+        ]
+        _ml_runtime.CLF_PATH = resolved_artifacts[
+            "final_28class_dses_classifier.joblib"
+        ]
+        _ml_runtime.FEATURE_COLS_PATH = resolved_artifacts[
+            "final_28class_feature_columns.joblib"
+        ]
+
+        build_features = _ml_runtime.build_features
+        predict_patient = _ml_runtime.predict_patient
 
     except Exception as exc:
         st.set_page_config(
@@ -119,7 +164,8 @@ else:
     )
 
     st.write(
-        "Place these files in the same folder as app.py:"
+        "Expected Python modules beside app.py and trained "
+        "model artifacts either beside app.py or in `pkl+joblib/`:"
     )
 
     for filename in missing:
@@ -160,11 +206,7 @@ def get_references():
 
 @st.cache_resource(show_spinner=False)
 def get_diseases():
-    return [
-        disease
-        for disease in DISEASE_REACTION_MAP.keys()
-        if str(disease).strip().lower() != "healthy"
-    ]
+    return list(DISEASE_REACTION_MAP.keys())
 
 
 try:
