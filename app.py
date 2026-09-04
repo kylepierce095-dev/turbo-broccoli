@@ -160,7 +160,11 @@ def get_references():
 
 @st.cache_resource(show_spinner=False)
 def get_diseases():
-    return list(DISEASE_REACTION_MAP.keys())
+    return [
+        disease
+        for disease in DISEASE_REACTION_MAP.keys()
+        if str(disease).strip().lower() != "healthy"
+    ]
 
 
 try:
