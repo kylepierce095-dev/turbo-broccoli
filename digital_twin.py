@@ -1140,17 +1140,53 @@ DEFAULT_REFERENCE_WORKBOOK = (
     "Cardiac_Disease_Synchronized_Dataset_Patient_1_"
     "Literature_Conditioned_CLEAN (4).xlsx"
 )
-DEFAULT_CACHE = Path(__file__).resolve().parent / "dt_reference_values.pkl"
+DEFAULT_CACHE = Path(__file__).resolve().parent / "dt_reference_values_UPDATED.pkl"
 
 def build_or_load_references(workbook_path=None, cache_path=None):
     workbook_path = str(workbook_path or DEFAULT_REFERENCE_WORKBOOK)
     cache_path = str(cache_path or DEFAULT_CACHE)
+
+    required_keys = {
+        "reaction_references",
+        "disease_raw_medians",
+        "disease_signature_scalars",
+        "mapping",
+        "factors",
+    }
+
+    # Load only a cache produced by the current reference-builder.
     if Path(cache_path).exists():
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
+        try:
+            with open(cache_path, "rb") as f:
+                bundle = pickle.load(f)
+
+            if isinstance(bundle, dict) and required_keys.issubset(bundle.keys()):
+                return bundle
+
+            # Legacy/incompatible cache: remove it and rebuild.
+            try:
+                Path(cache_path).unlink()
+            except OSError:
+                pass
+
+        except Exception:
+            try:
+                Path(cache_path).unlink()
+            except OSError:
+                pass
+
     bundle = build_training_references(workbook_path)
+
+    if not isinstance(bundle, dict) or not required_keys.issubset(bundle.keys()):
+        raise ValueError(
+            "Reference builder returned an incomplete bundle. "
+            "Expected keys: "
+            + ", ".join(sorted(required_keys))
+        )
+
     with open(cache_path, "wb") as f:
         pickle.dump(bundle, f)
+
     return bundle
 
 def compute_patient_state(**patient):
