@@ -289,15 +289,45 @@ def get_references():
 
     workbook = next((p for p in workbook_candidates if p.exists()), None)
 
-    cache = dt_module_dir / "dt_reference_values.pkl"
+    cache = dt_module_dir / "dt_reference_values_UPDATED.pkl"
 
     if workbook is not None:
-        return build_or_load_references(
+        bundle = build_or_load_references(
+            workbook_path=str(workbook),
+            cache_path=str(cache),
+        )
+    else:
+        bundle = build_or_load_references()
+
+    # Never pass an incompatible/legacy reference cache to the
+    # current Digital Twin engine.
+    required_keys = {
+        "reaction_references",
+        "disease_raw_medians",
+        "disease_signature_scalars",
+        "mapping",
+        "factors",
+    }
+
+    if not required_keys.issubset(bundle.keys()):
+        try:
+            if cache.exists():
+                cache.unlink()
+        except OSError:
+            pass
+
+        if workbook is None:
+            raise ValueError(
+                "The Digital Twin reference cache is incompatible and "
+                "the reference workbook is unavailable for rebuilding."
+            )
+
+        bundle = build_or_load_references(
             workbook_path=str(workbook),
             cache_path=str(cache),
         )
 
-    return build_or_load_references()
+    return bundle
 
 
 @st.cache_resource(show_spinner=False)
