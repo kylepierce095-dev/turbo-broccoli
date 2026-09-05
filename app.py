@@ -36,6 +36,8 @@
 
 from pathlib import Path
 import sys
+import tempfile
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -65,13 +67,57 @@ SEARCH_DIRS = [
     BASE_DIR / "pkl+joblib",
 ]
 
+# The 32.2 MB final classifier is stored as a GitHub Release asset
+# because GitHub's normal repository uploader has a 25 MB limit.
+MODEL_RELEASE_URL = (
+    "https://github.com/qp361516-stack/turbo-broccoli/"
+    "releases/download/v1.0/final_28class_dses_classifier.joblib"
+)
+
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "cardiac_dses_models"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOADED_CLASSIFIER = (
+    DOWNLOAD_DIR / "final_28class_dses_classifier.joblib"
+)
+
+
 def resolve_file(filename):
     """Return the first existing file in the supported runtime directories."""
     for directory in SEARCH_DIRS:
         candidate = directory / filename
         if candidate.exists():
             return candidate
+
+    # The large final classifier can also be resolved from the
+    # GitHub Release download cache.
+    if filename == "final_28class_dses_classifier.joblib":
+        if DOWNLOADED_CLASSIFIER.exists():
+            return DOWNLOADED_CLASSIFIER
+
     return None
+
+
+def ensure_final_classifier():
+    """Download the GitHub Release classifier only when it is not local."""
+    existing = resolve_file("final_28class_dses_classifier.joblib")
+    if existing is not None:
+        return existing, None
+
+    try:
+        urllib.request.urlretrieve(
+            MODEL_RELEASE_URL,
+            DOWNLOADED_CLASSIFIER,
+        )
+        if not DOWNLOADED_CLASSIFIER.exists():
+            raise RuntimeError("Download completed but the model file was not created.")
+        return DOWNLOADED_CLASSIFIER, None
+    except Exception as exc:
+        if DOWNLOADED_CLASSIFIER.exists():
+            try:
+                DOWNLOADED_CLASSIFIER.unlink()
+            except OSError:
+                pass
+        return None, exc
 
 
 REQUIRED_MODULES = [
@@ -79,6 +125,8 @@ REQUIRED_MODULES = [
     "ml_final_28class_FIXED.py",
 ]
 
+# The final classifier is downloaded from the public GitHub Release
+# when it is not already present in the repository.
 REQUIRED_ARTIFACTS = [
     "disease_dses_rf.joblib",
     "disease_dses_model_columns.joblib",
@@ -89,6 +137,7 @@ REQUIRED_ARTIFACTS = [
 
 missing = []
 resolved_modules = {}
+resolved_artifacts = {}
 
 for filename in REQUIRED_MODULES:
     path = resolve_file(filename)
@@ -97,9 +146,20 @@ for filename in REQUIRED_MODULES:
     else:
         resolved_modules[filename] = path
 
-resolved_artifacts = {}
+# Resolve/download the large classifier before checking the remaining artifacts.
+classifier_path, classifier_error = ensure_final_classifier()
+if classifier_path is not None:
+    resolved_artifacts["final_28class_dses_classifier.joblib"] = classifier_path
+elif classifier_error is not None:
+    missing.append(
+        "pkl+joblib/final_28class_dses_classifier.joblib "
+        f"(GitHub Release download failed: {classifier_error})"
+    )
 
 for filename in REQUIRED_ARTIFACTS:
+    if filename == "final_28class_dses_classifier.joblib":
+        continue
+
     path = resolve_file(filename)
     if path is None:
         missing.append(f"pkl+joblib/{filename}")
@@ -157,7 +217,7 @@ if not missing:
         )
         st.title("Cardiac DSES Digital Twin")
         st.error(
-            "The 87% architecture could not be loaded."
+            "The final 28-class architecture could not be loaded."
         )
         st.exception(exc)
         st.stop()
@@ -169,7 +229,7 @@ else:
     st.title("Cardiac DSES Digital Twin")
 
     st.error(
-        "Required 87% architecture files are missing."
+        "Required final 28-class architecture files are missing."
     )
 
     st.write(
@@ -593,7 +653,7 @@ if run_button:
     # ARCHITECTURE PIPELINE
     # ========================================================
 
-    st.header("87% Architecture")
+    st.header("Final 28-Class Architecture")
 
     pipeline = go.Figure(
         go.Sankey(
